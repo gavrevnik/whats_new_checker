@@ -235,7 +235,7 @@ def sp_get_filter(df_stat,
 
     df_stat = df_stat[(df_stat.release_date > release_date_min)
                       & (df_stat.release_date < release_date_max)
-                      & (df_stat.album.apply(lambda x: all(sub not in x for sub in album_flt)))
+                      & (df_stat.album.apply(lambda x: all(sub.lower() not in x.lower() for sub in album_flt)))
                       & (df_stat.album_artists.apply(lambda x: len(ast.literal_eval(x)) <= max_artists_in_album))
                       & (~df_stat.album_type.isin(album_type_flt))
                     ]
