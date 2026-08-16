@@ -1,0 +1,6 @@
+#!/bin/zsh
+set -eu
+
+SCRIPT_DIR="${0:A:h}"
+REPO_DIR="${SCRIPT_DIR}/../../.."
+exec /usr/bin/python3 "${REPO_DIR}/app/server.py" --open-browser

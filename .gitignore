@@ -1,0 +1,11 @@
+api.py
+/SECRETS
+__pycache__/
+.cache
+.DS_Store
+.ipynb_checkpoints/
+*.py[cod]
+.env
+.env.*
+!.env.example
+data/settings.json

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Что дальше?</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%2318392e'/%3E%3Cpath d='M16 32h30M35 21l11 11-11 11' fill='none' stroke='%23f5b19d' stroke-width='5'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#"><span class="brand-mark">→</span><span>Что дальше?</span></a>
+      <nav aria-label="Основная навигация">
+        <button class="nav-item active" data-view="backlog"><span>⌁</span> Бэклог</button>
+        <button class="nav-item" data-view="consumed"><span>✓</span> Просмотрено</button>
+        <button class="nav-item" data-view="people"><span>♙</span> Персоны</button>
+        <button class="nav-item" data-view="recommend"><span>✦</span> Рекомендации</button>
+      </nav>
+      <div class="sidebar-foot"><span class="status-dot"></span><span>SQLite · локально</span></div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><p class="eyebrow">Личная фильмотека</p><h1 id="page-title">Бэклог</h1></div>
+        <div class="header-actions">
+          <label class="search"><span>⌕</span><input id="search" placeholder="Найти фильм"></label>
+          <button id="open-add" class="button secondary">+ Добавить фильм</button>
+          <button id="open-add-person" class="button secondary hidden">+ Добавить персону</button>
+        </div>
+      </header>
+
+      <div class="content-choice">
+        <label for="content-type">Тип контента</label>
+        <select id="content-type" data-testid="content-type"><option value="movie">Фильмы</option></select>
+        <span>Инфраструктура готова к добавлению новых типов позже</span>
+      </div>
+
+      <section id="library-view">
+        <div id="backlog-panel">
+          <div class="section-bar">
+            <div><p class="eyebrow">К просмотру</p><h2>Фильмы в очереди <span id="backlog-count" class="count"></span></h2></div>
+            <button id="refresh-tmdb" class="button primary" data-testid="refresh-tmdb">↻ Актуализировать из TMDB</button>
+          </div>
+          <div id="refresh-progress" class="notice hidden"></div>
+          <div class="table-wrap"><table class="movie-table backlog-table"><thead><tr>
+            <th><button class="sort-button" data-sort="title_ru">Название</button></th>
+            <th><button class="sort-button" data-sort="release_date">Дата выхода</button></th>
+            <th><button class="sort-button" data-sort="directors">Режиссёр</button></th>
+            <th><button class="sort-button" data-sort="imdb_rating">IMDb</button></th>
+            <th><button class="sort-button" data-sort="genres">Жанр</button></th>
+            <th><button class="sort-button" data-sort="key_people">Ключевые персоны</button></th>
+            <th><button class="sort-button" data-sort="tmdb_id">TMDB ID</button></th><th>IMDb / TMDB</th><th></th>
+          </tr></thead><tbody id="backlog-body"></tbody></table></div>
+          <div id="backlog-empty" class="empty hidden">В бэклоге ничего нет.</div>
+        </div>
+
+        <div id="consumed-panel" class="hidden">
+          <div class="rating-board">
+            <section class="rating-column"><div class="column-head"><span class="column-dot neutral"></span><h2>Оценить</h2><span id="unrated-count" class="count"></span></div><div id="unrated-list" class="card-list"></div></section>
+            <section class="rating-column"><div class="column-head"><span class="column-dot liked"></span><h2>Понравилось</h2><span id="liked-count" class="count"></span></div><div id="liked-list" class="card-list"></div></section>
+            <section class="rating-column"><div class="column-head"><span class="column-dot disliked"></span><h2>Не понравилось</h2><span id="disliked-count" class="count"></span></div><div id="disliked-list" class="card-list"></div></section>
+          </div>
+        </div>
+      </section>
+
+      <section id="people-view" class="hidden">
+        <div class="section-bar">
+          <div><p class="eyebrow">Любимые авторы и исполнители</p><h2>Персоны <span id="people-count" class="count"></span></h2></div>
+          <button id="refresh-people" class="button primary" data-testid="refresh-people">↻ Актуализировать из TMDB</button>
+        </div>
+        <div id="people-refresh-progress" class="notice hidden"></div>
+        <div class="people-board">
+          <section class="people-panel"><div class="column-head"><span class="column-dot liked"></span><h2>Режиссёры</h2><span id="directors-count" class="count"></span></div>
+            <div class="table-wrap"><table class="people-table"><thead><tr><th>Имя на русском</th><th>Оригинальное имя</th><th>TMDB ID</th></tr></thead><tbody id="directors-body"></tbody></table></div>
+          </section>
+          <section class="people-panel"><div class="column-head"><span class="column-dot neutral"></span><h2>Актёры</h2><span id="actors-count" class="count"></span></div>
+            <div class="table-wrap"><table class="people-table"><thead><tr><th>Имя на русском</th><th>Оригинальное имя</th><th>TMDB ID</th></tr></thead><tbody id="actors-body"></tbody></table></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="recommend-view" class="hidden">
+        <div class="recommend-intro">
+          <div><p class="eyebrow">Новые находки</p><h2>Рекомендации фильмов</h2><p>Подготовьте запрос для LLM или получите список напрямую из TMDB.</p></div>
+          <div class="mode-switch"><button class="active" data-mode="llm">Через LLM</button><button data-mode="api">Через API</button></div>
+        </div>
+        <form id="recommend-form" class="filter-panel">
+          <div class="people-filter">
+            <details><summary>Актёры <span id="actors-selected"></span></summary><div class="dropdown-list"><label class="select-all"><input type="checkbox" data-select-all="actor"> Выбрать всех</label><div id="actor-options"></div></div></details>
+            <details><summary>Режиссёры <span id="directors-selected"></span></summary><div class="dropdown-list"><label class="select-all"><input type="checkbox" data-select-all="director"> Выбрать всех</label><div id="director-options"></div></div></details>
+          </div>
+          <div class="filter-grid">
+            <label>TMDB от<input name="min_tmdb_rating" type="number" min="0" max="10" step="0.1" value="6"></label>
+            <label>IMDb от<input name="min_imdb_rating" type="number" min="0" max="10" step="0.1" value="0"></label>
+            <label>Год от<input name="year_from" type="number" value="2020"></label>
+            <label>Мин. голосов<input name="min_votes" type="number" value="100"></label>
+            <label>Мин. длительность<input name="min_runtime" type="number" value="100"></label>
+            <label>Количество<input name="limit" type="number" min="1" max="50" value="20"></label>
+            <label class="wide">Исключить жанры<input name="excluded_genres" value="Animation, Documentary"></label>
+          </div>
+          <button id="recommend-action" class="button primary" type="submit">Подготовить промпт</button>
+        </form>
+
+        <div id="llm-result" class="result-panel">
+          <div class="section-bar compact"><div><p class="eyebrow">Готовый запрос</p><h2>Промпт для LLM</h2></div><button id="copy-prompt" class="button secondary" type="button">Копировать</button></div>
+          <textarea id="prompt-output" readonly placeholder="Настройте фильтры и нажмите «Подготовить промпт»"></textarea>
+        </div>
+        <div id="api-result" class="result-panel hidden">
+          <div class="section-bar compact"><div><p class="eyebrow">TMDB + OMDb</p><h2>Новые фильмы</h2></div><span id="api-status" class="api-badge">TMDB</span></div>
+          <div id="api-message" class="notice">Выберите фильтры и запустите обновление.</div>
+          <div class="table-wrap"><table class="movie-table"><thead><tr>
+            <th>Название</th><th>Дата выхода</th><th>Режиссёр</th><th>IMDb</th><th>Жанр</th><th>Ключевые персоны</th><th>TMDB ID</th><th>IMDb / TMDB</th><th>Подробнее</th><th></th>
+          </tr></thead><tbody id="recommend-body"></tbody></table></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="details-dialog"><div class="dialog-head"><div><p class="eyebrow">Карточка фильма</p><h2 id="details-title"></h2></div><div class="dialog-head-actions"><button id="refresh-detail" class="button secondary" type="button">↻ Актуализировать из TMDB</button><button class="dialog-close" type="button" data-close-dialog="details-dialog">×</button></div></div><div id="details-content" class="details-grid"></div></dialog>
+
+  <dialog id="add-dialog"><form id="add-form"><div class="dialog-head"><h2>Добавить фильм</h2><button type="button" data-close-dialog="add-dialog">×</button></div><div class="form-grid">
+    <label>Оригинальное название<input name="title_original" required></label><label>Название на русском<input name="title_ru" required></label>
+    <label>Год<input name="year" type="number"></label><label>Режиссёр<input name="directors"></label>
+    <label class="wide">Заметка<textarea name="notes" rows="3"></textarea></label>
+  </div><p id="add-error" class="error"></p><div class="dialog-actions"><button type="button" class="button secondary" data-close-dialog="add-dialog">Отмена</button><button class="button primary" type="submit">Добавить</button></div></form></dialog>
+
+  <dialog id="add-person-dialog"><form id="add-person-form"><div class="dialog-head"><h2>Добавить персону</h2><button type="button" data-close-dialog="add-person-dialog">×</button></div><div class="form-grid">
+    <label>Тип<select name="role" required><option value="director">Режиссёр</option><option value="actor">Актёр</option></select></label>
+    <label>TMDB ID (необязательно)<input name="tmdb_id" type="number" min="1"></label>
+    <label>Оригинальное имя<input name="name_original" required></label><label>Имя на русском<input name="name_ru" required></label>
+  </div><p id="add-person-error" class="error"></p><div class="dialog-actions"><button type="button" class="button secondary" data-close-dialog="add-person-dialog">Отмена</button><button class="button primary" type="submit">Добавить</button></div></form></dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
