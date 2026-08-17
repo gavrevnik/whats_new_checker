@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS content_items (
     source TEXT NOT NULL DEFAULT 'manual',
     source_url TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
+    raw_json TEXT NOT NULL DEFAULT '{}',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     added_at TEXT NOT NULL,
     consumed_at TEXT,
@@ -56,9 +57,11 @@ CREATE TABLE IF NOT EXISTS movies (
     release_year INTEGER,
     runtime_minutes INTEGER,
     imdb_rating REAL,
+    kinopoisk_rating REAL,
     tmdb_rating REAL,
     tmdb_vote_count INTEGER,
     imdb_id TEXT,
+    kinopoisk_id INTEGER,
     tmdb_id INTEGER UNIQUE,
     overview TEXT NOT NULL DEFAULT '',
     original_language TEXT NOT NULL DEFAULT '',
@@ -78,6 +81,7 @@ CREATE TABLE IF NOT EXISTS people (
     name_ru TEXT NOT NULL,
     tmdb_id INTEGER UNIQUE,
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    raw_json TEXT NOT NULL DEFAULT '{}',
     details_json TEXT NOT NULL DEFAULT '{}',
     tmdb_updated_at TEXT
 );
@@ -123,9 +127,20 @@ CREATE TABLE IF NOT EXISTS content_aliases (
     UNIQUE (content_id, alias, provider, external_id)
 );
 
+CREATE TABLE IF NOT EXISTS trash_entries (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL CHECK (entity_type IN ('movie', 'person')),
+    entity_id TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT '',
+    snapshot_json TEXT NOT NULL DEFAULT '{}',
+    trashed_at TEXT NOT NULL,
+    UNIQUE (entity_type, entity_id, role)
+);
+
 CREATE INDEX IF NOT EXISTS idx_content_state ON content_items(content_type, status, reaction);
 CREATE INDEX IF NOT EXISTS idx_movie_people_interest ON movie_people(movie_id, is_interest);
 CREATE INDEX IF NOT EXISTS idx_alias_value ON content_aliases(alias);
+CREATE INDEX IF NOT EXISTS idx_trash_entity ON trash_entries(entity_type, entity_id, role);
 """
 
 
@@ -176,7 +191,12 @@ def initialize_database(path: Path | None = None) -> None:
     with _lock, connect(path) as connection:
         connection.executescript(SCHEMA)
         migrations = {
+            "content_items": {
+                "raw_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
             "movies": {
+                "kinopoisk_rating": "REAL",
+                "kinopoisk_id": "INTEGER",
                 "tagline": "TEXT NOT NULL DEFAULT ''",
                 "content_rating": "TEXT NOT NULL DEFAULT ''",
                 "imdb_votes": "TEXT NOT NULL DEFAULT ''",
@@ -185,6 +205,7 @@ def initialize_database(path: Path | None = None) -> None:
                 "details_json": "TEXT NOT NULL DEFAULT '{}'",
             },
             "people": {
+                "raw_json": "TEXT NOT NULL DEFAULT '{}'",
                 "details_json": "TEXT NOT NULL DEFAULT '{}'",
                 "tmdb_updated_at": "TEXT",
             },
@@ -201,6 +222,12 @@ def initialize_database(path: Path | None = None) -> None:
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (2, ?)", (_now(),)
         )
         connection.execute(
+            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (3, ?)", (_now(),)
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (4, ?)", (_now(),)
+        )
+        connection.execute(
             "INSERT OR IGNORE INTO content_types(code, name_ru, enabled) VALUES ('movie', 'Фильмы', 1)"
         )
 
@@ -210,15 +237,18 @@ def _movie_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
     query = f"""
         SELECT
             i.id, i.content_type, i.title_ru, i.title_original, i.status, i.reaction,
-            i.source, i.source_url AS url, i.notes, i.metadata_json, i.added_at,
+            i.source, i.source_url AS url, i.notes, COALESCE(i.raw_json, '{{}}') AS raw_json,
+            i.metadata_json, i.added_at,
             COALESCE(i.consumed_at, '') AS consumed_at, i.updated_at,
             COALESCE(m.release_date, '') AS release_date,
             COALESCE(m.release_year, '') AS year,
             COALESCE(m.runtime_minutes, '') AS duration_minutes,
             COALESCE(m.imdb_rating, '') AS imdb_rating,
+            COALESCE(m.kinopoisk_rating, '') AS kinopoisk_rating,
             COALESCE(m.tmdb_rating, '') AS tmdb_rating,
             COALESCE(m.tmdb_vote_count, '') AS tmdb_vote_count,
             COALESCE(m.imdb_id, '') AS imdb_id,
+            COALESCE(m.kinopoisk_id, '') AS kinopoisk_id,
             COALESCE(m.tmdb_id, '') AS tmdb_id,
             COALESCE(m.overview, '') AS overview,
             COALESCE(m.original_language, '') AS original_language,
@@ -294,8 +324,10 @@ def _movie_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
             result.update(details)
         imdb_id = str(result.get("imdb_id") or "")
         tmdb_id = str(result.get("tmdb_id") or "")
+        kinopoisk_id = str(result.get("kinopoisk_id") or "")
         result["imdb_link"] = f"https://www.imdb.com/title/{imdb_id}/" if imdb_id else ""
         result["tmdb_link"] = f"https://www.themoviedb.org/movie/{tmdb_id}" if tmdb_id else ""
+        result["kinopoisk_link"] = f"https://www.kinopoisk.ru/film/{kinopoisk_id}/" if kinopoisk_id else ""
         result["external_link"] = result["imdb_link"] or result["tmdb_link"] or str(result.get("url") or "")
         key_parts = []
         if result.get("key_actors"):
@@ -306,7 +338,11 @@ def _movie_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
     return results
 
 
-def list_library(content_type: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+def list_library(
+    content_type: str | None = None,
+    status: str | None = None,
+    include_trashed: bool = False,
+) -> list[dict[str, Any]]:
     clauses = ["i.content_type = 'movie'"]
     params: list[Any] = []
     if content_type:
@@ -315,6 +351,11 @@ def list_library(content_type: str | None = None, status: str | None = None) -> 
     if status:
         clauses.append("i.status = ?")
         params.append(status)
+    if not include_trashed:
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM trash_entries t "
+            "WHERE t.entity_type = 'movie' AND t.entity_id = i.id)"
+        )
     return _movie_select("WHERE " + " AND ".join(clauses), tuple(params))
 
 
@@ -327,7 +368,11 @@ def get_item(item_id: str) -> dict[str, Any]:
 
 def list_interests(content_type: str | None = None, role: str | None = None) -> list[dict[str, Any]]:
     initialize_database()
-    clauses = ["p.active = 1"]
+    clauses = [
+        "p.active = 1",
+        "NOT EXISTS (SELECT 1 FROM trash_entries t WHERE t.entity_type = 'person' "
+        "AND t.entity_id = p.id AND t.role = ir.role)",
+    ]
     params: list[Any] = []
     if content_type:
         clauses.append("ir.content_type = ?")
@@ -339,6 +384,7 @@ def list_interests(content_type: str | None = None, role: str | None = None) -> 
         SELECT p.id, ir.content_type, ir.role, p.name_original, p.name_ru,
                'tmdb' AS provider, COALESCE(p.tmdb_id, '') AS external_id,
                COALESCE(p.tmdb_id, '') AS tmdb_id, p.active, ir.notes,
+               COALESCE(p.raw_json, '{{}}') AS raw_json,
                COALESCE(p.details_json, '{{}}') AS details_json,
                COALESCE(p.tmdb_updated_at, '') AS tmdb_updated_at
         FROM people p JOIN interest_roles ir ON ir.person_id = p.id
@@ -347,6 +393,84 @@ def list_interests(content_type: str | None = None, role: str | None = None) -> 
     """
     with connect() as connection:
         return [dict(row) for row in connection.execute(query, tuple(params)).fetchall()]
+
+
+def list_trash() -> list[dict[str, Any]]:
+    initialize_database()
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT id, entity_type, entity_id, role, snapshot_json, trashed_at "
+            "FROM trash_entries ORDER BY trashed_at DESC"
+        ).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        result = dict(row)
+        try:
+            snapshot = json.loads(result.pop("snapshot_json") or "{}")
+        except json.JSONDecodeError:
+            snapshot = {}
+        if isinstance(snapshot, dict):
+            result.update(snapshot)
+        results.append(result)
+    return results
+
+
+def trash_entity(payload: dict[str, Any]) -> dict[str, Any]:
+    entity_type = str(payload.get("entity_type") or "").strip()
+    entity_id = str(payload.get("entity_id") or payload.get("id") or "").strip()
+    role = str(payload.get("role") or "").strip() if entity_type == "person" else ""
+    if entity_type not in {"movie", "person"} or not entity_id:
+        raise StorageError("Movie or person is required")
+    if entity_type == "person" and role not in {"actor", "director"}:
+        raise StorageError("Person role must be actor or director")
+    initialize_database()
+    trash_id = f"trash-{uuid.uuid4().hex[:12]}"
+    with _lock, connect() as connection:
+        if entity_type == "movie":
+            row = connection.execute(
+                "SELECT i.title_ru, i.title_original, COALESCE(m.release_year, '') AS year "
+                "FROM content_items i JOIN movies m ON m.content_id = i.id WHERE i.id = ?",
+                (entity_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT p.name_ru, p.name_original, COALESCE(p.tmdb_id, '') AS tmdb_id "
+                "FROM people p JOIN interest_roles ir ON ir.person_id = p.id "
+                "WHERE p.id = ? AND ir.content_type = 'movie' AND ir.role = ?",
+                (entity_id, role),
+            ).fetchone()
+        if not row:
+            raise StorageError("Movie or person not found")
+        try:
+            connection.execute(
+                "INSERT INTO trash_entries(id, entity_type, entity_id, role, snapshot_json, trashed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (trash_id, entity_type, entity_id, role, _json(dict(row), "{}"), _now()),
+            )
+        except sqlite3.IntegrityError as error:
+            raise StorageError("This item is already in trash") from error
+    return next(item for item in list_trash() if item["id"] == trash_id)
+
+
+def restore_trash(trash_id: str) -> dict[str, Any]:
+    initialize_database()
+    with _lock, connect() as connection:
+        row = connection.execute(
+            "SELECT id, entity_type, entity_id, role, snapshot_json, trashed_at "
+            "FROM trash_entries WHERE id = ?",
+            (trash_id,),
+        ).fetchone()
+        if not row:
+            raise StorageError("Trash item not found")
+        result = dict(row)
+        connection.execute("DELETE FROM trash_entries WHERE id = ?", (trash_id,))
+    try:
+        snapshot = json.loads(result.pop("snapshot_json") or "{}")
+    except json.JSONDecodeError:
+        snapshot = {}
+    if isinstance(snapshot, dict):
+        result.update(snapshot)
+    return result
 
 
 def add_interest_person(person: dict[str, Any]) -> dict[str, Any]:
@@ -359,6 +483,13 @@ def add_interest_person(person: dict[str, Any]) -> dict[str, Any]:
         raise StorageError("Person name is required")
     tmdb_raw = person.get("tmdb_id") or person.get("external_id")
     tmdb_id = int(tmdb_raw) if str(tmdb_raw).isdigit() else None
+    raw_json = _json(
+        person.get("raw_data") or {
+            key: person.get(key) for key in ("role", "tmdb_id", "name_original", "name_ru")
+            if person.get(key) not in (None, "")
+        },
+        "{}",
+    )
     initialize_database()
     with _lock, connect() as connection:
         existing = None
@@ -373,13 +504,14 @@ def add_interest_person(person: dict[str, Any]) -> dict[str, Any]:
         if existing:
             connection.execute(
                 "UPDATE people SET active = 1, tmdb_id = COALESCE(tmdb_id, ?), "
-                "name_original = COALESCE(NULLIF(name_original, ''), ?), name_ru = COALESCE(NULLIF(name_ru, ''), ?) WHERE id = ?",
-                (tmdb_id, name_original, name_ru, person_id),
+                "name_original = COALESCE(NULLIF(name_original, ''), ?), name_ru = COALESCE(NULLIF(name_ru, ''), ?), "
+                "raw_json = ? WHERE id = ?",
+                (tmdb_id, name_original, name_ru, raw_json, person_id),
             )
         else:
             connection.execute(
-                "INSERT INTO people(id, name_original, name_ru, tmdb_id, active) VALUES (?, ?, ?, ?, 1)",
-                (person_id, name_original, name_ru, tmdb_id),
+                "INSERT INTO people(id, name_original, name_ru, tmdb_id, active, raw_json) VALUES (?, ?, ?, ?, 1, ?)",
+                (person_id, name_original, name_ru, tmdb_id, raw_json),
             )
         if connection.execute(
             "SELECT 1 FROM interest_roles WHERE person_id = ? AND content_type = 'movie' AND role = ?",
@@ -589,21 +721,31 @@ def add_item(item: dict[str, Any]) -> dict[str, Any]:
         if _duplicate(connection, item):
             raise StorageError("This movie is already in the library")
         connection.execute(
-            "INSERT INTO content_items(id, content_type, title_ru, title_original, status, reaction, source, source_url, notes, metadata_json, added_at, consumed_at, updated_at) "
-            "VALUES (?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO content_items(id, content_type, title_ru, title_original, status, reaction, source, source_url, notes, raw_json, metadata_json, added_at, consumed_at, updated_at) "
+            "VALUES (?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 item_id, str(item.get("title_ru") or "").strip(), str(item.get("title_original") or "").strip(),
                 status, reaction, str(item.get("source") or "manual"), str(item.get("url") or item.get("source_url") or ""),
-                str(item.get("notes") or ""), _json(item.get("metadata_json"), "{}"), str(item.get("added_at") or now), consumed_at, now,
+                str(item.get("notes") or ""),
+                _json(
+                    item.get("raw_data") or {
+                        key: item.get(key) for key in ("title_original", "title_ru", "year", "directors", "notes", "tmdb_id")
+                        if item.get(key) not in (None, "")
+                    },
+                    "{}",
+                ),
+                _json(item.get("metadata_json"), "{}"), str(item.get("added_at") or now), consumed_at, now,
             ),
         )
         connection.execute(
-            "INSERT INTO movies(content_id, release_date, release_year, runtime_minutes, imdb_rating, tmdb_rating, tmdb_vote_count, imdb_id, tmdb_id, overview, original_language, awards_json, tagline, content_rating, imdb_votes, metascore, box_office, details_json, tmdb_updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO movies(content_id, release_date, release_year, runtime_minutes, imdb_rating, kinopoisk_rating, tmdb_rating, tmdb_vote_count, imdb_id, kinopoisk_id, tmdb_id, overview, original_language, awards_json, tagline, content_rating, imdb_votes, metascore, box_office, details_json, tmdb_updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 item_id, item.get("release_date") or None, _year(item), item.get("duration_minutes") or item.get("runtime_minutes") or None,
-                imdb_rating or None, tmdb_rating or None, item.get("tmdb_vote_count") or None,
-                item.get("imdb_id") or None, int(tmdb_id) if str(tmdb_id).isdigit() else None,
+                imdb_rating or None, item.get("kinopoisk_rating") or None, tmdb_rating or None,
+                item.get("tmdb_vote_count") or None, item.get("imdb_id") or None,
+                int(item["kinopoisk_id"]) if str(item.get("kinopoisk_id") or "").isdigit() else None,
+                int(tmdb_id) if str(tmdb_id).isdigit() else None,
                 str(item.get("overview") or ""), str(item.get("original_language") or ""),
                 _json(item.get("awards_json"), "[]"), str(item.get("tagline") or ""),
                 str(item.get("content_rating") or ""), str(item.get("imdb_votes") or ""),
@@ -616,6 +758,11 @@ def add_item(item: dict[str, Any]) -> dict[str, Any]:
             connection.execute(
                 "INSERT OR IGNORE INTO content_aliases(content_id, alias, language, provider, external_id, notes) VALUES (?, '', '', 'tmdb', ?, 'Added automatically')",
                 (item_id, str(tmdb_id)),
+            )
+        if str(item.get("kinopoisk_id") or "").isdigit():
+            connection.execute(
+                "INSERT OR IGNORE INTO content_aliases(content_id, alias, language, provider, external_id, notes) VALUES (?, '', '', 'kinopoisk', ?, 'Added automatically')",
+                (item_id, str(item["kinopoisk_id"])),
             )
     return get_item(item_id)
 
@@ -657,16 +804,19 @@ def update_movie_from_provider(item_id: str, details: dict[str, Any]) -> dict[st
         )
         connection.execute(
             "UPDATE movies SET release_date = ?, release_year = ?, runtime_minutes = ?, "
-            "imdb_rating = COALESCE(?, imdb_rating), tmdb_rating = ?, tmdb_vote_count = ?, "
-            "imdb_id = COALESCE(NULLIF(?, ''), imdb_id), tmdb_id = ?, overview = ?, original_language = ?, "
+            "imdb_rating = COALESCE(?, imdb_rating), kinopoisk_rating = COALESCE(?, kinopoisk_rating), "
+            "tmdb_rating = ?, tmdb_vote_count = ?, imdb_id = COALESCE(NULLIF(?, ''), imdb_id), "
+            "kinopoisk_id = COALESCE(?, kinopoisk_id), tmdb_id = ?, overview = ?, original_language = ?, "
             "awards_json = COALESCE(?, awards_json), tagline = COALESCE(NULLIF(?, ''), tagline), "
             "content_rating = COALESCE(NULLIF(?, ''), content_rating), imdb_votes = COALESCE(NULLIF(?, ''), imdb_votes), "
             "metascore = COALESCE(?, metascore), box_office = COALESCE(NULLIF(?, ''), box_office), "
             "details_json = ?, tmdb_updated_at = ? WHERE content_id = ?",
             (
                 details.get("release_date") or None, _year(details), details.get("duration_minutes") or None,
-                details.get("imdb_rating") or None, details.get("tmdb_rating") or None, details.get("tmdb_vote_count") or None,
-                details.get("imdb_id") or "", details.get("tmdb_id") or None, details.get("overview") or "",
+                details.get("imdb_rating") or None, details.get("kinopoisk_rating") or None,
+                details.get("tmdb_rating") or None, details.get("tmdb_vote_count") or None,
+                details.get("imdb_id") or "", details.get("kinopoisk_id") or None,
+                details.get("tmdb_id") or None, details.get("overview") or "",
                 details.get("original_language") or "", _json(details["awards_json"], "[]") if details.get("awards_json") else None,
                 str(details.get("tagline") or ""), str(details.get("content_rating") or ""),
                 str(details.get("imdb_votes") or ""), details.get("metascore") or None,
@@ -675,18 +825,23 @@ def update_movie_from_provider(item_id: str, details: dict[str, Any]) -> dict[st
             ),
         )
         _replace_movie_relations(connection, item_id, details)
+        if str(details.get("kinopoisk_id") or "").isdigit():
+            connection.execute(
+                "INSERT OR IGNORE INTO content_aliases(content_id, alias, language, provider, external_id, notes) VALUES (?, '', '', 'kinopoisk', ?, 'Added automatically')",
+                (item_id, str(details["kinopoisk_id"])),
+            )
     return get_item(item_id)
 
 
 def movie_refresh_targets() -> list[dict[str, Any]]:
     return [
-        {key: row[key] for key in ("id", "title_original", "title_ru", "year", "tmdb_id")}
+        {key: row[key] for key in ("id", "title_original", "title_ru", "year", "tmdb_id", "kinopoisk_rating")}
         for row in list_library(content_type="movie")
     ]
 
 
 def known_movie_keys() -> tuple[set[str], set[str]]:
-    rows = list_library(content_type="movie")
+    rows = list_library(content_type="movie", include_trashed=True)
     ids = {str(row["tmdb_id"]) for row in rows if row.get("tmdb_id") != ""}
     titles: set[str] = set()
     for row in rows:

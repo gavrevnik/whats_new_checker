@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import threading
 import urllib.request
 import webbrowser
@@ -16,11 +17,12 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import storage, tmdb
+from app import llm, storage, tmdb
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-APP_VERSION = 4
+PID_FILE = Path(__file__).resolve().parents[1] / ".runtime" / "server.pid"
+APP_VERSION = 14
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -72,6 +74,7 @@ class Handler(BaseHTTPRequestHandler):
                     "interests": storage.list_interests(),
                     "content_types": storage.list_content_types(),
                     "tmdb": tmdb.configuration(),
+                    "llm": llm.configuration(),
                 }
             )
             return
@@ -79,12 +82,30 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             self._json({"items": storage.list_interests("movie", query.get("role", [None])[0])})
             return
+        if parsed.path == "/api/trash":
+            self._json({"items": storage.list_trash()})
+            return
         self._serve_static(parsed.path)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
             payload = self._body()
+            if parsed.path == "/api/resolve/movie":
+                self._json({"item": tmdb.resolve_movie_input(payload)})
+                return
+            if parsed.path == "/api/resolve/person":
+                self._json({"item": tmdb.resolve_person_input(payload)})
+                return
+            if parsed.path == "/api/trash":
+                self._json({"item": storage.trash_entity(payload)}, HTTPStatus.CREATED)
+                return
+            if parsed.path.startswith("/api/trash/") and parsed.path.endswith("/restore"):
+                trash_id = unquote(parsed.path[len("/api/trash/"):-len("/restore")]).strip("/")
+                if not trash_id:
+                    raise ValueError("Trash item ID is required")
+                self._json({"item": storage.restore_trash(trash_id)})
+                return
             if parsed.path == "/api/library":
                 self._json({"item": storage.add_item(payload)}, HTTPStatus.CREATED)
                 return
@@ -103,11 +124,20 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/people/refresh-tmdb":
                 self._json(tmdb.refresh_people())
                 return
+            if parsed.path.startswith("/api/people/") and parsed.path.endswith("/refresh-tmdb"):
+                person_id = unquote(parsed.path[len("/api/people/"):-len("/refresh-tmdb")]).strip("/")
+                if not person_id:
+                    raise ValueError("Person ID is required")
+                self._json({"item": tmdb.refresh_person(person_id)})
+                return
             if parsed.path == "/api/recommendations/tmdb":
                 self._json({"items": tmdb.recommend_movies(payload)})
                 return
+            if parsed.path == "/api/recommendations/llm":
+                self._json(llm.recommend_movies(payload))
+                return
             self._error("Endpoint not found", HTTPStatus.NOT_FOUND)
-        except (ValueError, storage.StorageError, tmdb.TmdbError) as error:
+        except (ValueError, storage.StorageError, tmdb.TmdbError, llm.LlmError) as error:
             self._error(str(error))
         except Exception as error:
             self._error(f"Internal error: {error}", HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -166,6 +196,8 @@ def main() -> None:
         print(f"Already running at {url}")
         return
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     if args.open_browser:
         threading.Timer(0.35, lambda: webbrowser.open(url)).start()
     print(f"Content library is available at {url}")
@@ -175,6 +207,11 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        try:
+            if PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                PID_FILE.unlink()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

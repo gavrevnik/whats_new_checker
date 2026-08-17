@@ -60,7 +60,13 @@ class StorageTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertTrue({"content_items","movies","people","interest_roles","movie_people","genres","content_aliases"} <= tables)
+        self.assertTrue({"content_items","movies","people","interest_roles","movie_people","genres","content_aliases","trash_entries"} <= tables)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertIn("raw_json", {row[1] for row in connection.execute("PRAGMA table_info(content_items)")})
+            self.assertIn("raw_json", {row[1] for row in connection.execute("PRAGMA table_info(people)")})
+            movie_columns = {row[1] for row in connection.execute("PRAGMA table_info(movies)")}
+            self.assertIn("kinopoisk_id", movie_columns)
+            self.assertIn("kinopoisk_rating", movie_columns)
 
     def test_people_can_be_added_and_refreshed(self) -> None:
         created = storage.add_interest_person({
@@ -92,12 +98,49 @@ class StorageTests(unittest.TestCase):
         created = storage.add_item({"content_type":"movie","title_original":"Test","title_ru":"Тест","tmdb_id":123})
         updated = storage.update_movie_from_provider(created["id"], {
             "title_original":"Test", "title_ru":"Тест", "tmdb_id":123, "imdb_id":"tt0123",
+            "kinopoisk_id":456, "kinopoisk_rating":7.4,
             "tagline":"A tagline", "imdb_votes":"12,345", "metascore":77, "box_office":"$1,000",
             "cast":"Actor One; Actor Two", "keywords":"memory; dream",
         })
         self.assertEqual(updated["cast"], "Actor One; Actor Two")
         self.assertEqual(updated["imdb_link"], "https://www.imdb.com/title/tt0123/")
+        self.assertEqual(updated["kinopoisk_link"], "https://www.kinopoisk.ru/film/456/")
+        self.assertEqual(updated["kinopoisk_rating"], 7.4)
         self.assertEqual(updated["metascore"], 77)
+
+        refreshed = storage.update_movie_from_provider(created["id"], {
+            "title_original":"Test", "title_ru":"Тест", "tmdb_id":123,
+        })
+        self.assertEqual(refreshed["kinopoisk_rating"], 7.4)
+
+    def test_movie_raw_input_and_trash_restore(self) -> None:
+        raw = {"title_ru":"сияние", "year":"1980"}
+        created = storage.add_item({
+            "content_type":"movie", "title_original":"The Shining", "title_ru":"Сияние",
+            "year":"1980", "tmdb_id":694, "raw_data":raw,
+        })
+        self.assertEqual(json.loads(created["raw_json"]), raw)
+        trashed = storage.trash_entity({"entity_type":"movie", "entity_id":created["id"]})
+        self.assertEqual(storage.list_library(), [])
+        self.assertEqual(storage.list_trash()[0]["title_original"], "The Shining")
+        known_ids, _ = storage.known_movie_keys()
+        self.assertIn("694", known_ids)
+        storage.restore_trash(trashed["id"])
+        self.assertEqual(storage.list_library()[0]["id"], created["id"])
+        self.assertEqual(storage.list_trash(), [])
+
+    def test_person_raw_input_and_trash_restore(self) -> None:
+        raw = {"role":"actor", "name_ru":"иван иванов"}
+        created = storage.add_interest_person({
+            "role":"actor", "name_original":"Ivan Ivanov", "name_ru":"Иван Иванов",
+            "tmdb_id":987654, "raw_data":raw,
+        })
+        self.assertEqual(json.loads(created["raw_json"]), raw)
+        trashed = storage.trash_entity({"entity_type":"person", "entity_id":created["id"], "role":"actor"})
+        self.assertFalse(any(item["id"] == created["id"] for item in storage.list_interests("movie")))
+        self.assertEqual(storage.list_trash()[0]["role"], "actor")
+        storage.restore_trash(trashed["id"])
+        self.assertTrue(any(item["id"] == created["id"] for item in storage.list_interests("movie")))
 
 
 if __name__ == "__main__":

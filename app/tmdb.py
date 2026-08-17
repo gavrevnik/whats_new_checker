@@ -18,6 +18,7 @@ from app.storage import ROOT, _normalized
 
 BASE_URL = "https://api.themoviedb.org/3"
 OMDB_URL = "https://www.omdbapi.com/"
+KINOPOISK_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films"
 
 
 class TmdbError(RuntimeError):
@@ -61,8 +62,19 @@ def get_omdb_key() -> tuple[str | None, str]:
     return (value, "SECRETS") if value else (None, "not configured")
 
 
-def _request_json(url: str) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "WhatsNewChecker/2.0"})
+def get_kinopoisk_key() -> tuple[str | None, str]:
+    value = os.environ.get("KINOPOISK_API_KEY", "").strip()
+    if value:
+        return value, "environment"
+    value = _local_secrets().get("KINOPOISK_API_KEY", "")
+    return (value, "SECRETS") if value else (None, "not configured")
+
+
+def _request_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "WhatsNewChecker/2.0", **(headers or {})},
+    )
     try:
         with urllib.request.urlopen(request, timeout=25) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -114,12 +126,75 @@ def _get_omdb(imdb_id: str) -> dict[str, Any]:
     }
 
 
+def _get_kinopoisk(imdb_id: str, title_original: str, title_ru: str, year: Any) -> dict[str, Any]:
+    """Resolve a movie and its Kinopoisk rating with one provider request."""
+    api_key, _ = get_kinopoisk_key()
+    if not api_key:
+        return {}
+    target_year = int(year) if str(year).isdigit() else None
+    query = title_ru or title_original
+    if query:
+        params = {"keyword": query, "type": "FILM"}
+        if target_year is not None:
+            params.update({"yearFrom": max(1000, target_year - 1), "yearTo": target_year + 1})
+    elif imdb_id:
+        params = {"imdbId": imdb_id}
+    else:
+        return {}
+    try:
+        payload = _request_json(
+            f"{KINOPOISK_URL}?{urllib.parse.urlencode(params)}",
+            {"X-API-KEY": api_key},
+        )
+    except TmdbError:
+        # This companion provider must not make an otherwise valid TMDB refresh fail.
+        return {}
+    items = payload.get("items", [])
+    if not isinstance(items, list):
+        return {}
+    imdb_candidates = [item for item in items if imdb_id and str(item.get("imdbId") or "") == imdb_id]
+    wanted = {_normalized(title_original), _normalized(title_ru)} - {""}
+    title_candidates = []
+    for item in items:
+        names = {
+            _normalized(str(item.get("nameOriginal") or "")),
+            _normalized(str(item.get("nameEn") or "")),
+            _normalized(str(item.get("nameRu") or "")),
+        } - {""}
+        candidate_year = item.get("year")
+        year_matches = (
+            target_year is None
+            or str(candidate_year).isdigit() and abs(int(candidate_year) - target_year) <= 1
+        )
+        if wanted & names and year_matches:
+            title_candidates.append(item)
+    candidates = imdb_candidates or title_candidates
+    if not candidates:
+        return {}
+    candidate = max(candidates, key=lambda item: float(item.get("ratingKinopoisk") or 0))
+    kinopoisk_id = candidate.get("kinopoiskId")
+    rating = candidate.get("ratingKinopoisk")
+    if not str(kinopoisk_id).isdigit():
+        return {}
+    try:
+        numeric_rating = float(rating) if rating not in (None, "") else None
+    except (TypeError, ValueError):
+        numeric_rating = None
+    return {
+        "kinopoisk_id": int(kinopoisk_id),
+        "kinopoisk_rating": numeric_rating,
+        "kinopoisk_link": f"https://www.kinopoisk.ru/film/{int(kinopoisk_id)}/",
+    }
+
+
 def configuration() -> dict[str, Any]:
     key, source = get_api_key()
     omdb_key, omdb_source = get_omdb_key()
+    kinopoisk_key, kinopoisk_source = get_kinopoisk_key()
     return {
         "configured": bool(key), "source": source,
         "omdb_configured": bool(omdb_key), "omdb_source": omdb_source,
+        "kinopoisk_configured": bool(kinopoisk_key), "kinopoisk_source": kinopoisk_source,
         "awards_note": "TMDB does not provide structured awards; OMDb summary is used when configured.",
     }
 
@@ -132,7 +207,11 @@ def _interest_index() -> dict[int, dict[str, Any]]:
     }
 
 
-def movie_details(tmdb_id: int, api_key: str | None = None) -> dict[str, Any]:
+def movie_details(
+    tmdb_id: int,
+    api_key: str | None = None,
+    fetch_kinopoisk: bool = True,
+) -> dict[str, Any]:
     api_key = api_key or get_api_key()[0]
     if not api_key:
         raise TmdbError("TMDB_API_KEY is not configured")
@@ -187,6 +266,12 @@ def movie_details(tmdb_id: int, api_key: str | None = None) -> dict[str, Any]:
     imdb_id = str(details.get("imdb_id") or "")
     companion = _get_omdb(imdb_id)
     release_date = str(details.get("release_date") or "")
+    kinopoisk = _get_kinopoisk(
+        imdb_id,
+        str(details.get("original_title") or ""),
+        str(details.get("title") or ""),
+        release_date[:4],
+    ) if fetch_kinopoisk else {}
     release_groups = details.get("release_dates", {}).get("results", [])
     certification = ""
     for country_code in ("RU", "US"):
@@ -244,6 +329,7 @@ def movie_details(tmdb_id: int, api_key: str | None = None) -> dict[str, Any]:
         "tmdb_vote_count": int(details.get("vote_count") or 0),
         "imdb_id": imdb_id,
         "tmdb_id": int(details["id"]),
+        **kinopoisk,
         "overview": str(details.get("overview") or companion.get("omdb_plot") or ""),
         "original_language": str(details.get("original_language") or ""),
         "awards_json": companion.get("awards_json", []),
@@ -315,37 +401,68 @@ def resolve_person(query: str, role: str, api_key: str) -> int:
     return int(candidates[0]["id"])
 
 
+def resolve_person_input(payload: dict[str, Any]) -> dict[str, Any]:
+    api_key, _ = get_api_key()
+    if not api_key:
+        raise TmdbError("TMDB_API_KEY is not configured")
+    role = str(payload.get("role") or "").strip()
+    if role not in {"actor", "director"}:
+        raise TmdbError("Person role must be actor or director")
+    tmdb_raw = payload.get("tmdb_id") or payload.get("external_id")
+    if str(tmdb_raw).isdigit():
+        tmdb_id = int(tmdb_raw)
+    else:
+        query = str(payload.get("name_original") or payload.get("name_ru") or "").strip()
+        if not query:
+            raise TmdbError("Enter a person name or TMDB ID")
+        tmdb_id = resolve_person(query, role, api_key)
+    return {**person_details(tmdb_id, api_key), "role": role}
+
+
+def _person_matches_target(target: dict[str, Any], details: dict[str, Any]) -> bool:
+    expected = [str(target.get("name_original") or ""), str(target.get("name_ru") or "")]
+    metadata = details.get("details_json") if isinstance(details.get("details_json"), dict) else {}
+    actual = [str(details.get("name_original") or ""), str(details.get("name_ru") or "")]
+    actual.extend(str(value) for value in metadata.get("also_known_as", []))
+    expected_norm = [_normalized(value) for value in expected if _normalized(value)]
+    actual_norm = [_normalized(value) for value in actual if _normalized(value)]
+    return any(
+        left == right or difflib.SequenceMatcher(None, left, right).ratio() >= 0.78
+        for left in expected_norm for right in actual_norm
+    )
+
+
+def _fetch_person_target(target: dict[str, Any], api_key: str) -> tuple[str, dict[str, Any]]:
+    tmdb_id = target.get("tmdb_id") or target.get("external_id")
+    details = person_details(int(tmdb_id), api_key) if str(tmdb_id).isdigit() else None
+    query = target.get("name_original") or target.get("name_ru") or ""
+    resolved_id = resolve_person(query, target["role"], api_key)
+    if details is None or not _person_matches_target(target, details) or int(details["tmdb_id"]) != resolved_id:
+        details = person_details(resolved_id, api_key)
+    return str(target["id"]), details
+
+
+def refresh_person(person_id: str) -> dict[str, Any]:
+    api_key, _ = get_api_key()
+    if not api_key:
+        raise TmdbError("TMDB_API_KEY is not configured")
+    target = next((row for row in storage.list_interests("movie") if str(row["id"]) == person_id), None)
+    if not target:
+        raise TmdbError("Person not found")
+    target_id, details = _fetch_person_target(target, api_key)
+    return storage.update_interest_person(target_id, details)
+
+
 def refresh_people() -> dict[str, Any]:
     api_key, _ = get_api_key()
     if not api_key:
         raise TmdbError("TMDB_API_KEY is not configured")
     targets = storage.list_interests("movie")
 
-    def matches_target(target: dict[str, Any], details: dict[str, Any]) -> bool:
-        expected = [str(target.get("name_original") or ""), str(target.get("name_ru") or "")]
-        metadata = details.get("details_json") if isinstance(details.get("details_json"), dict) else {}
-        actual = [str(details.get("name_original") or ""), str(details.get("name_ru") or "")]
-        actual.extend(str(value) for value in metadata.get("also_known_as", []))
-        expected_norm = [_normalized(value) for value in expected if _normalized(value)]
-        actual_norm = [_normalized(value) for value in actual if _normalized(value)]
-        return any(
-            left == right or difflib.SequenceMatcher(None, left, right).ratio() >= 0.78
-            for left in expected_norm for right in actual_norm
-        )
-
-    def fetch(target: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        tmdb_id = target.get("tmdb_id") or target.get("external_id")
-        details = person_details(int(tmdb_id), api_key) if str(tmdb_id).isdigit() else None
-        query = target.get("name_original") or target.get("name_ru") or ""
-        resolved_id = resolve_person(query, target["role"], api_key)
-        if details is None or not matches_target(target, details) or int(details["tmdb_id"]) != resolved_id:
-            details = person_details(resolved_id, api_key)
-        return target["id"], details
-
     errors: list[dict[str, str]] = []
     updated = 0
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(fetch, target): target for target in targets}
+        futures = {executor.submit(_fetch_person_target, target, api_key): target for target in targets}
         for future in as_completed(futures):
             target = futures[future]
             try:
@@ -388,6 +505,28 @@ def resolve_movie(title_original: str, title_ru: str, year: Any, api_key: str) -
     raise TmdbError(f"TMDB match is ambiguous: {query} ({year or 'year unknown'})")
 
 
+def resolve_movie_input(payload: dict[str, Any]) -> dict[str, Any]:
+    api_key, _ = get_api_key()
+    if not api_key:
+        raise TmdbError("TMDB_API_KEY is not configured")
+    search_field = str(payload.get("search_field") or "").strip()
+    identity_edited = search_field in {"title_original", "title_ru", "year"}
+    tmdb_raw = None if identity_edited else payload.get("tmdb_id") or payload.get("external_id")
+    if str(tmdb_raw).isdigit():
+        tmdb_id = int(tmdb_raw)
+    else:
+        title_original = str(payload.get("title_original") or "").strip()
+        title_ru = str(payload.get("title_ru") or "").strip()
+        if search_field == "title_original":
+            title_ru = ""
+        elif search_field == "title_ru":
+            title_original = ""
+        if not title_original and not title_ru:
+            raise TmdbError("Enter a movie title or TMDB ID")
+        tmdb_id = resolve_movie(title_original, title_ru, payload.get("year"), api_key)
+    return movie_details(tmdb_id, api_key)
+
+
 def refresh_library() -> dict[str, Any]:
     api_key, _ = get_api_key()
     if not api_key:
@@ -398,7 +537,9 @@ def refresh_library() -> dict[str, Any]:
         tmdb_id = target.get("tmdb_id")
         if not str(tmdb_id).isdigit():
             tmdb_id = resolve_movie(target["title_original"], target["title_ru"], target["year"], api_key)
-        return target["id"], movie_details(int(tmdb_id), api_key)
+        return target["id"], movie_details(
+            int(tmdb_id), api_key, fetch_kinopoisk=target.get("kinopoisk_rating") in (None, ""),
+        )
 
     updated: list[str] = []
     errors: list[dict[str, str]] = []
@@ -423,7 +564,10 @@ def refresh_movie(item_id: str) -> dict[str, Any]:
     tmdb_id = target.get("tmdb_id")
     if not str(tmdb_id).isdigit():
         tmdb_id = resolve_movie(target["title_original"], target["title_ru"], target.get("year"), api_key)
-    return storage.update_movie_from_provider(item_id, movie_details(int(tmdb_id), api_key))
+    return storage.update_movie_from_provider(
+        item_id,
+        movie_details(int(tmdb_id), api_key, fetch_kinopoisk=target.get("kinopoisk_rating") in (None, "")),
+    )
 
 
 def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
