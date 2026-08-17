@@ -1,4 +1,0 @@
-interface:
-  display_name: "Обогатить рекомендации"
-  short_description: "Подобрать и отфильтровать новый контент"
-  default_prompt: "Используй $enrich-content-backlog, чтобы подобрать новые рекомендации без дублей."

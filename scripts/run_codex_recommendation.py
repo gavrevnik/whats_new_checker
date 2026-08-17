@@ -22,8 +22,8 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--schema", type=Path, required=True)
     args = parser.parse_args()
-    prompt = sys.stdin.read().strip()
-    if not prompt:
+    recommendation_instructions = sys.stdin.read().strip()
+    if not recommendation_instructions:
         raise SystemExit("Recommendation prompt is empty")
     try:
         output_schema = json.loads(args.schema.read_text(encoding="utf-8"))
@@ -35,13 +35,22 @@ def main() -> None:
         with Codex(config) as codex:
             thread = codex.thread_start(
                 approval_mode=ApprovalMode.deny_all,
-                base_instructions=BASE_INSTRUCTIONS,
+                base_instructions=(
+                    f"{BASE_INSTRUCTIONS}\n\n"
+                    "The following recommendation contract is mandatory system-level context. "
+                    "Apply every enabled filter before choosing movies:\n\n"
+                    f"{recommendation_instructions}"
+                ),
                 cwd=directory,
                 ephemeral=True,
                 model=args.model,
                 sandbox=Sandbox.read_only,
             )
-            result = thread.run(prompt, sandbox=Sandbox.read_only, output_schema=output_schema)
+            result = thread.run(
+                "Выполни заданный в системных инструкциях контракт рекомендации фильмов.",
+                sandbox=Sandbox.read_only,
+                output_schema=output_schema,
+            )
     if result.error:
         raise SystemExit(str(result.error))
     if not result.final_response:

@@ -19,10 +19,44 @@ from app.storage import ROOT, _normalized
 BASE_URL = "https://api.themoviedb.org/3"
 OMDB_URL = "https://www.omdbapi.com/"
 KINOPOISK_URL = "https://kinopoiskapiunofficial.tech/api/v2.2/films"
+TMDB_GENRE_ALIASES = {
+    28: {"action", "боевик"},
+    12: {"adventure", "приключения"},
+    16: {"animation", "animated", "анимация", "мультфильм", "анимационный"},
+    35: {"comedy", "комедия"},
+    80: {"crime", "криминал", "криминальный"},
+    99: {"documentary", "документальный", "документальное кино", "документалистика"},
+    18: {"drama", "драма"},
+    10751: {"family", "семейный"},
+    14: {"fantasy", "фэнтези"},
+    36: {"history", "история", "исторический"},
+    27: {"horror", "ужасы"},
+    10402: {"music", "музыка", "музыкальный"},
+    9648: {"mystery", "детектив"},
+    10749: {"romance", "мелодрама", "романтика"},
+    878: {"science fiction", "sci-fi", "фантастика", "научная фантастика"},
+    10770: {"tv movie", "телевизионный фильм"},
+    53: {"thriller", "триллер"},
+    10752: {"war", "военный"},
+    37: {"western", "вестерн"},
+}
 
 
 class TmdbError(RuntimeError):
     pass
+
+
+def _excluded_genre_filters(raw: Any) -> tuple[set[int], set[str]]:
+    values = raw if isinstance(raw, list) else str(raw or "").split(",")
+    requested = {_normalized(str(value)) for value in values if _normalized(str(value))}
+    genre_ids: set[int] = set()
+    names = set(requested)
+    for genre_id, aliases in TMDB_GENRE_ALIASES.items():
+        normalized_aliases = {_normalized(alias) for alias in aliases}
+        if requested & normalized_aliases:
+            genre_ids.add(genre_id)
+            names.update(normalized_aliases)
+    return genre_ids, names
 
 
 def _local_secrets() -> dict[str, str]:
@@ -90,7 +124,10 @@ def _request_json(url: str, headers: dict[str, str] | None = None) -> dict[str, 
 
 def _get(path: str, params: dict[str, Any], api_key: str) -> dict[str, Any]:
     query = urllib.parse.urlencode({**params, "api_key": api_key})
-    return _request_json(f"{BASE_URL}{path}?{query}")
+    try:
+        return _request_json(f"{BASE_URL}{path}?{query}")
+    except TmdbError as error:
+        raise TmdbError(f"TMDB: {error}") from error
 
 
 def _get_omdb(imdb_id: str) -> dict[str, Any]:
@@ -146,9 +183,21 @@ def _get_kinopoisk(imdb_id: str, title_original: str, title_ru: str, year: Any) 
             f"{KINOPOISK_URL}?{urllib.parse.urlencode(params)}",
             {"X-API-KEY": api_key},
         )
-    except TmdbError:
+    except TmdbError as error:
         # This companion provider must not make an otherwise valid TMDB refresh fail.
-        return {}
+        is_limit = "HTTP 402" in str(error) or "HTTP 429" in str(error)
+        message = (
+            "Достигнут лимит запросов Kinopoisk API. Фильм создан без рейтинга и ссылки КП."
+            if is_limit
+            else f"Kinopoisk API недоступен: {error}. Фильм создан без данных КП."
+        )
+        return {
+            "provider_warnings": [{
+                "provider": "kinopoisk",
+                "kind": "limit" if is_limit else "error",
+                "message": message,
+            }],
+        }
     items = payload.get("items", [])
     if not isinstance(items, list):
         return {}
@@ -543,6 +592,7 @@ def refresh_library() -> dict[str, Any]:
 
     updated: list[str] = []
     errors: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(fetch, target): target for target in targets}
         for future in as_completed(futures):
@@ -551,9 +601,13 @@ def refresh_library() -> dict[str, Any]:
                 item_id, details = future.result()
                 storage.update_movie_from_provider(item_id, details)
                 updated.append(item_id)
+                warnings.extend(details.get("provider_warnings", []))
             except Exception as error:
                 errors.append({"id": str(target["id"]), "title": str(target["title_original"]), "error": str(error)})
-    return {"total": len(targets), "updated": len(updated), "failed": len(errors), "errors": errors}
+    return {
+        "total": len(targets), "updated": len(updated), "failed": len(errors),
+        "errors": errors, "provider_warnings": warnings,
+    }
 
 
 def refresh_movie(item_id: str) -> dict[str, Any]:
@@ -564,10 +618,13 @@ def refresh_movie(item_id: str) -> dict[str, Any]:
     tmdb_id = target.get("tmdb_id")
     if not str(tmdb_id).isdigit():
         tmdb_id = resolve_movie(target["title_original"], target["title_ru"], target.get("year"), api_key)
-    return storage.update_movie_from_provider(
-        item_id,
-        movie_details(int(tmdb_id), api_key, fetch_kinopoisk=target.get("kinopoisk_rating") in (None, "")),
+    details = movie_details(
+        int(tmdb_id), api_key, fetch_kinopoisk=target.get("kinopoisk_rating") in (None, ""),
     )
+    item = storage.update_movie_from_provider(item_id, details)
+    if details.get("provider_warnings"):
+        item["provider_warnings"] = details["provider_warnings"]
+    return item
 
 
 def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
@@ -587,14 +644,16 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
     if not interests:
         raise TmdbError("Select at least one actor or director")
 
-    min_tmdb_rating = float(filters.get("min_tmdb_rating", filters.get("min_rating", 0)) or 0)
     min_imdb_rating = float(filters.get("min_imdb_rating", 0) or 0)
+    min_kinopoisk_rating = float(filters.get("min_kinopoisk_rating", 0) or 0)
     min_votes = int(filters.get("min_votes", 0) or 0)
     min_runtime = int(filters.get("min_runtime", 0) or 0)
     date_from = str(filters.get("date_from") or "1900-01-01")
     date_to = str(filters.get("date_to") or date.today().isoformat())
+    if date_from > date_to:
+        raise TmdbError("Начальный год не может быть больше конечного")
     limit = min(max(int(filters.get("limit", 20) or 20), 1), 50)
-    excluded_genres = {str(value).casefold() for value in filters.get("excluded_genres", [])}
+    excluded_genre_ids, excluded_genres = _excluded_genre_filters(filters.get("excluded_genres", []))
 
     candidates: dict[int, dict[str, Any]] = {}
     for person in interests:
@@ -607,7 +666,9 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
             release_date = str(row.get("release_date") or "")
             if not movie_id or not (date_from <= release_date <= date_to):
                 continue
-            if float(row.get("vote_average") or 0) < min_tmdb_rating or int(row.get("vote_count") or 0) < min_votes:
+            if excluded_genre_ids & {int(value) for value in row.get("genre_ids", []) if str(value).isdigit()}:
+                continue
+            if int(row.get("vote_count") or 0) < min_votes:
                 continue
             candidates.setdefault(int(movie_id), row)
 
@@ -636,7 +697,18 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if min_imdb_rating and float(details.get("imdb_rating") or 0) < min_imdb_rating:
             continue
-        if excluded_genres & {genre.strip().casefold() for genre in details.get("genres", "").split(";")}:
+        if min_kinopoisk_rating:
+            rating = details.get("kinopoisk_rating")
+            kinopoisk_failed = any(
+                warning.get("provider") == "kinopoisk"
+                for warning in details.get("provider_warnings", [])
+                if isinstance(warning, dict)
+            )
+            if rating in (None, "") and not kinopoisk_failed:
+                continue
+            if rating not in (None, "") and float(rating) < min_kinopoisk_rating:
+                continue
+        if excluded_genres & {_normalized(genre) for genre in details.get("genres", "").split(";")}:
             continue
         results.append(details)
         if len(results) >= limit:

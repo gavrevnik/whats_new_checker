@@ -13,6 +13,7 @@ The active datastore is `data/library.sqlite3`. The application initializes miss
 - `genres` / `movie_genres`: normalized movie genres.
 - `content_aliases`: aliases and external mappings used for deduplication.
 - `trash_entries`: reversible soft-delete markers for a movie or a person role, plus a compact display snapshot. Active queries exclude marked entities; their normalized data and relationships remain intact.
+- `favorite_movies`: independent movie-to-favorite marker and addition timestamp. Adding or removing it does not change movie status, reaction, notes, or recommendation history.
 
 `awards_json` is a JSON array. A summary-only provider uses:
 

@@ -137,6 +137,11 @@ CREATE TABLE IF NOT EXISTS trash_entries (
     UNIQUE (entity_type, entity_id, role)
 );
 
+CREATE TABLE IF NOT EXISTS favorite_movies (
+    content_id TEXT PRIMARY KEY REFERENCES content_items(id) ON DELETE CASCADE,
+    added_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_content_state ON content_items(content_type, status, reaction);
 CREATE INDEX IF NOT EXISTS idx_movie_people_interest ON movie_people(movie_id, is_interest);
 CREATE INDEX IF NOT EXISTS idx_alias_value ON content_aliases(alias);
@@ -228,6 +233,9 @@ def initialize_database(path: Path | None = None) -> None:
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (4, ?)", (_now(),)
         )
         connection.execute(
+            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (5, ?)", (_now(),)
+        )
+        connection.execute(
             "INSERT OR IGNORE INTO content_types(code, name_ru, enabled) VALUES ('movie', 'Фильмы', 1)"
         )
 
@@ -260,6 +268,7 @@ def _movie_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
             COALESCE(m.box_office, '') AS box_office,
             COALESCE(m.details_json, '{{}}') AS details_json,
             COALESCE(m.tmdb_updated_at, '') AS tmdb_updated_at,
+            EXISTS(SELECT 1 FROM favorite_movies f WHERE f.content_id = i.id) AS favorite,
             COALESCE((
                 SELECT group_concat(display_name, '; ')
                 FROM (
@@ -322,6 +331,7 @@ def _movie_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
             details = {}
         if isinstance(details, dict):
             result.update(details)
+        result["favorite"] = bool(result.get("favorite"))
         imdb_id = str(result.get("imdb_id") or "")
         tmdb_id = str(result.get("tmdb_id") or "")
         kinopoisk_id = str(result.get("kinopoisk_id") or "")
@@ -364,6 +374,22 @@ def get_item(item_id: str) -> dict[str, Any]:
     if not rows:
         raise StorageError("Item not found")
     return rows[0]
+
+
+def set_favorite(item_id: str, favorite: bool) -> dict[str, Any]:
+    initialize_database()
+    with _lock, connect() as connection:
+        if not connection.execute("SELECT 1 FROM movies WHERE content_id = ?", (item_id,)).fetchone():
+            raise StorageError("Movie not found")
+        if favorite:
+            connection.execute(
+                "INSERT INTO favorite_movies(content_id, added_at) VALUES (?, ?) "
+                "ON CONFLICT(content_id) DO NOTHING",
+                (item_id, _now()),
+            )
+        else:
+            connection.execute("DELETE FROM favorite_movies WHERE content_id = ?", (item_id,))
+    return get_item(item_id)
 
 
 def list_interests(content_type: str | None = None, role: str | None = None) -> list[dict[str, Any]]:

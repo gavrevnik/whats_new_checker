@@ -60,13 +60,28 @@ class StorageTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertTrue({"content_items","movies","people","interest_roles","movie_people","genres","content_aliases","trash_entries"} <= tables)
+        self.assertTrue({"content_items","movies","people","interest_roles","movie_people","genres","content_aliases","trash_entries","favorite_movies"} <= tables)
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertIn("raw_json", {row[1] for row in connection.execute("PRAGMA table_info(content_items)")})
             self.assertIn("raw_json", {row[1] for row in connection.execute("PRAGMA table_info(people)")})
             movie_columns = {row[1] for row in connection.execute("PRAGMA table_info(movies)")}
             self.assertIn("kinopoisk_id", movie_columns)
             self.assertIn("kinopoisk_rating", movie_columns)
+
+    def test_favorite_is_independent_from_status_and_reaction(self) -> None:
+        created = storage.add_item({
+            "content_type":"movie", "title_original":"Favorite", "title_ru":"Избранный",
+            "status":"consumed", "reaction":"like",
+        })
+        favorite = storage.set_favorite(created["id"], True)
+        self.assertTrue(favorite["favorite"])
+        self.assertEqual(favorite["status"], "consumed")
+        self.assertEqual(favorite["reaction"], "like")
+        moved = storage.update_item(created["id"], {"status":"backlog"})
+        self.assertTrue(moved["favorite"])
+        removed = storage.set_favorite(created["id"], False)
+        self.assertFalse(removed["favorite"])
+        self.assertEqual(removed["status"], "backlog")
 
     def test_people_can_be_added_and_refreshed(self) -> None:
         created = storage.add_interest_person({

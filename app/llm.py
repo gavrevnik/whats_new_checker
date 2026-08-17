@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -50,6 +51,17 @@ def _number(payload: dict[str, Any], key: str, default: float, minimum: float, m
     return value
 
 
+def _optional_number(
+    payload: dict[str, Any], key: str, default: float, minimum: float, maximum: float,
+) -> float | None:
+    disabled = payload.get("disabled_filters", [])
+    if not isinstance(disabled, list):
+        raise LlmError("disabled_filters must be an array")
+    if key in {str(value) for value in disabled}:
+        return None
+    return _number(payload, key, default, minimum, maximum)
+
+
 def _movie_line(item: dict[str, Any]) -> str:
     names = str(item.get("title_ru") or item.get("title_original") or "Без названия")
     original = str(item.get("title_original") or "")
@@ -74,33 +86,62 @@ def _section(title: str, lines: list[str]) -> str:
 
 def build_movie_prompt(payload: dict[str, Any]) -> str:
     current_year = date.today().year
-    imdb_rating = _number(payload, "min_imdb_rating", 6.5, 0, 10)
-    year_from = int(_number(payload, "year_from", 2020, 1888, current_year + 2))
-    year_to = int(_number(payload, "year_to", current_year, 1888, current_year + 2))
-    min_runtime = int(_number(payload, "min_runtime", 100, 0, 600))
-    limit = int(_number(payload, "limit", 10, 1, 20))
-    if year_from > year_to:
+    imdb_rating = _optional_number(payload, "min_imdb_rating", 7, 0, 10)
+    kinopoisk_rating = _optional_number(payload, "min_kinopoisk_rating", 0, 0, 10)
+    year_from_raw = _optional_number(payload, "year_from", 2020, 1888, current_year + 2)
+    year_to_raw = _optional_number(payload, "year_to", current_year, 1888, current_year + 2)
+    runtime_raw = _optional_number(payload, "min_runtime", 100, 0, 600)
+    year_from = int(year_from_raw) if year_from_raw is not None else None
+    year_to = int(year_to_raw) if year_to_raw is not None else None
+    min_runtime = int(runtime_raw) if runtime_raw is not None else None
+    liked_sample_size = int(_number(payload, "liked_sample_size", 30, 0, 200))
+    limit_raw = _optional_number(payload, "limit", 5, 1, 20)
+    limit = int(limit_raw) if limit_raw is not None else None
+    if year_from is not None and year_to is not None and year_from > year_to:
         raise LlmError("Начальный год не может быть больше конечного")
     user_prompt = str(payload.get("prompt") or "").strip()
     if len(user_prompt) > 8000:
         raise LlmError("Пользовательский промпт слишком длинный")
 
     movies = storage.list_library(content_type="movie")
-    liked = [_movie_line(item) for item in movies if item.get("status") == "consumed" and item.get("reaction") == "like"]
+    liked_movies = [item for item in movies if item.get("status") == "consumed" and item.get("reaction") == "like"]
+    liked = [
+        _movie_line(item)
+        for item in random.sample(liked_movies, min(liked_sample_size, len(liked_movies)))
+    ]
     backlog = [_movie_line(item) for item in movies if item.get("status") == "backlog"]
     people = [_person_line(person) for person in storage.list_interests("movie")]
     user_block = user_prompt or "Дополнительных пожеланий нет — подбери наиболее релевантные фильмы по профилю вкусов."
 
+    filters = []
+    if imdb_rating is not None:
+        filters.append(
+            f"- у фильма обязательно должен быть опубликованный IMDb rating не ниже {imdb_rating:g}; "
+            "фильмы без IMDb rating не предлагай"
+        )
+    if kinopoisk_rating is not None and kinopoisk_rating > 0:
+        filters.append(
+            f"- у фильма обязательно должен быть опубликованный рейтинг Кинопоиска не ниже {kinopoisk_rating:g}; "
+            "фильмы без рейтинга Кинопоиска не предлагай"
+        )
+    if year_from is not None and year_to is not None:
+        filters.append(f"- год выпуска от {year_from} до {year_to} включительно")
+    elif year_from is not None:
+        filters.append(f"- год выпуска не раньше {year_from}")
+    elif year_to is not None:
+        filters.append(f"- год выпуска не позже {year_to}")
+    if min_runtime is not None:
+        filters.append(f"- длительность не меньше {min_runtime} минут")
+    if limit is not None:
+        filters.append(f"- верни не более {limit} фильмов, соответствующих всем включённым условиям")
+
     return "\n\n".join([
         "Задача: порекомендуй фильмы с русским и оригинальным названием, соблюдая условия ниже. "
-        f"Верни {limit} наиболее релевантных позиций (меньше — только если фильтрам действительно не соответствует достаточно фильмов). "
+        f"Верни не более {limit if limit is not None else 10} наиболее релевантных позиций. "
         "Не включай фильмы из бэклога или просмотренные фильмы. Для каждой позиции дай короткий содержательный "
-        "комментарий на русском: почему фильм подходит именно этому пользователю.",
-        _section("Обязательные фильтры", [
-            f"- IMDb rating не ниже {imdb_rating:g}",
-            f"- год выпуска от {year_from} до {year_to} включительно",
-            f"- длительность не меньше {min_runtime} минут",
-        ]),
+        "комментарий на русском: почему фильм подходит именно этому пользователю. Все включённые условия являются жёсткими: "
+        "проверь их до формирования ответа и не предлагай фильм, если не можешь уверенно подтвердить соответствующее значение.",
+        _section("Обязательные фильтры", filters),
         f"Свободный запрос пользователя:\n{user_block}",
         _section("Фильмы, которые понравились пользователю", liked),
         _section(
@@ -167,18 +208,30 @@ def _enrich_candidate(candidate: dict[str, Any], api_key: str) -> dict[str, Any]
 
 def _passes_filters(item: dict[str, Any], payload: dict[str, Any]) -> str:
     current_year = date.today().year
-    min_imdb = _number(payload, "min_imdb_rating", 6.5, 0, 10)
-    year_from = int(_number(payload, "year_from", 2020, 1888, current_year + 2))
-    year_to = int(_number(payload, "year_to", current_year, 1888, current_year + 2))
-    min_runtime = int(_number(payload, "min_runtime", 100, 0, 600))
+    min_imdb = _optional_number(payload, "min_imdb_rating", 7, 0, 10)
+    min_kinopoisk = _optional_number(payload, "min_kinopoisk_rating", 0, 0, 10)
+    year_from_raw = _optional_number(payload, "year_from", 2020, 1888, current_year + 2)
+    year_to_raw = _optional_number(payload, "year_to", current_year, 1888, current_year + 2)
+    runtime_raw = _optional_number(payload, "min_runtime", 100, 0, 600)
+    year_from = int(year_from_raw) if year_from_raw is not None else None
+    year_to = int(year_to_raw) if year_to_raw is not None else None
+    min_runtime = int(runtime_raw) if runtime_raw is not None else None
     rating = item.get("imdb_rating")
+    kinopoisk_rating = item.get("kinopoisk_rating")
     year = str(item.get("year") or "")
     runtime = item.get("duration_minutes")
-    if rating in (None, "") or float(rating) < min_imdb:
+    if min_imdb is not None and (rating in (None, "") or float(rating) < min_imdb):
         return f"IMDb rating ниже {min_imdb:g} или недоступен"
-    if not year.isdigit() or not year_from <= int(year) <= year_to:
-        return f"год выпуска вне диапазона {year_from}–{year_to}"
-    if runtime in (None, "") or int(runtime) < min_runtime:
+    if min_kinopoisk is not None and min_kinopoisk > 0:
+        # Kinopoisk constrains the model prompt, but a missing companion rating
+        # must not hide an otherwise valid TMDB recommendation card.
+        if kinopoisk_rating not in (None, "") and float(kinopoisk_rating) < min_kinopoisk:
+            return f"рейтинг Кинопоиска ниже {min_kinopoisk:g}"
+    if year_from is not None and (not year.isdigit() or int(year) < year_from):
+        return f"год выпуска раньше {year_from}"
+    if year_to is not None and (not year.isdigit() or int(year) > year_to):
+        return f"год выпуска позже {year_to}"
+    if min_runtime is not None and (runtime in (None, "") or int(runtime) < min_runtime):
         return f"длительность меньше {min_runtime} мин. или недоступна"
     return ""
 
@@ -254,6 +307,7 @@ def recommend_movies(payload: dict[str, Any]) -> dict[str, Any]:
     if not answer:
         raise LlmError("Codex вернул пустой ответ")
     candidates = _parse_response(answer)
-    requested = int(_number(payload, "limit", 10, 1, 20))
+    limit_raw = _optional_number(payload, "limit", 5, 1, 20)
+    requested = int(limit_raw) if limit_raw is not None else 10
     items, errors = _enrich_movies(candidates[:requested], payload)
     return {"items": items, "errors": errors, "model": model, "requested": requested, "received": len(candidates)}

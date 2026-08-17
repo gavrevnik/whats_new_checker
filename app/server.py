@@ -22,7 +22,7 @@ from app import llm, storage, tmdb
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PID_FILE = Path(__file__).resolve().parents[1] / ".runtime" / "server.pid"
-APP_VERSION = 14
+APP_VERSION = 18
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -111,6 +111,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/library/refresh-tmdb":
                 self._json(tmdb.refresh_library())
+                return
+            if parsed.path.startswith("/api/library/") and parsed.path.endswith("/favorite"):
+                item_id = unquote(parsed.path[len("/api/library/"):-len("/favorite")]).strip("/")
+                if not item_id:
+                    raise ValueError("Movie ID is required")
+                favorite = payload.get("favorite")
+                if not isinstance(favorite, bool):
+                    raise ValueError("favorite must be a boolean")
+                self._json({"item": storage.set_favorite(item_id, favorite)})
                 return
             if parsed.path.startswith("/api/library/") and parsed.path.endswith("/refresh-tmdb"):
                 item_id = unquote(parsed.path[len("/api/library/"):-len("/refresh-tmdb")]).strip("/")

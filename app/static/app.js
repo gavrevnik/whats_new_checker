@@ -1,4 +1,4 @@
-const state = { items: [], interests: [], trash: [], view: "backlog", mode: "llm", query: "", apiItems: [], llmItems: [], llmErrors: [], tmdb: {}, llm: {}, sortKey: "release_date", sortDirection: "desc", currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingPersonDetails: null, pendingMovieRaw: null, pendingPersonRaw: null, pendingMovieSearchField: "" };
+const state = { items: [], interests: [], trash: [], view: "backlog", backlogRecommendMode: "llm", query: "", apiItems: [], llmItems: [], llmErrors: [], tmdb: {}, llm: {}, sortKey: "release_date", sortDirection: "desc", currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingPersonDetails: null, pendingMovieRaw: null, pendingPersonRaw: null, pendingMovieSearchField: "" };
 const $ = selector => document.querySelector(selector);
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
 
@@ -23,6 +23,16 @@ function awardsSummary(raw) {
 }
 
 function text(value) { return value === null || value === undefined || value === "" ? "—" : String(value); }
+function movieRatings(item) { return `${text(item.imdb_rating)} / ${text(item.kinopoisk_rating)}`; }
+function providerWarnings(items) {
+  const messages = items.flatMap(item => item?.provider_warnings || []).map(warning => warning.message).filter(Boolean);
+  return [...new Set(messages)];
+}
+function showProviderWarnings(items) {
+  const warnings = providerWarnings(items), node = $("#backlog-recommend-warning");
+  node.textContent = warnings.join(" "); node.classList.toggle("hidden", !warnings.length);
+  if (warnings.length) toast(warnings[0]);
+}
 function compactObject(value) { return Object.fromEntries(Object.entries(value).filter(([,item]) => item !== "" && item !== null && item !== undefined)); }
 function formatRaw(value) {
   try {
@@ -115,41 +125,35 @@ function updateSortIndicators() {
   });
 }
 
-function movieRow(item, context, index = 0) {
-  const action = context === "backlog"
-    ? `<button class="mini-button like" data-item-action="like" data-id="${escapeHtml(item.id)}">Нравится</button><button class="mini-button dislike" data-item-action="dislike" data-id="${escapeHtml(item.id)}">Не понравилось</button><button class="icon-button trash-button" data-trash-entity="movie" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить фильм в корзину">🗑</button>`
-    : `<button class="mini-button done" data-rec-action="backlog" data-index="${index}">В бэклог</button><button class="mini-button like" data-rec-action="like" data-index="${index}">Нравится</button><button class="mini-button dislike" data-rec-action="dislike" data-index="${index}">Не понравилось</button>`;
-  const titleCell = context === "backlog"
-    ? `<button class="movie-title-button" data-details-id="${escapeHtml(item.id)}"><strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span></button>`
-    : `<strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span>`;
-  const detailsCell = context === "recommend" ? `<td><button class="mini-button" data-rec-details="${index}">Подробнее</button></td>` : "";
-  const tmdbCell = context === "recommend" ? `<td>${escapeHtml(text(item.tmdb_id))}</td>` : "";
+function movieRow(item) {
+  const action = `<button class="mini-button like" data-item-action="like" data-id="${escapeHtml(item.id)}">Нравится</button><button class="mini-button dislike" data-item-action="dislike" data-id="${escapeHtml(item.id)}">Не понравилось</button><button class="icon-button trash-button" data-trash-entity="movie" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить фильм в корзину">🗑</button>`;
+  const titleCell = `<button class="movie-title-button" data-details-id="${escapeHtml(item.id)}"><strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span></button>`;
   return `<tr>
     <td class="movie-title">${titleCell}</td>
     <td>${escapeHtml(text(item.release_date || item.year))}</td><td>${escapeHtml(text(item.directors))}</td>
-    <td>${escapeHtml(text(item.imdb_rating))}</td><td>${escapeHtml(text(item.kinopoisk_rating))}</td><td>${escapeHtml(text(item.genres))}</td>
-    <td class="cell-people">${escapeHtml(text(formatKeyPeople(item, true)))}</td>${tmdbCell}
+    <td>${escapeHtml(movieRatings(item))}</td><td>${escapeHtml(text(item.countries))}</td><td>${escapeHtml(text(item.genres))}</td>
+    <td class="cell-people">${escapeHtml(text(formatKeyPeople(item, true)))}</td>
     <td class="cell-links">${movieLinksHtml(item)}</td>
-    ${detailsCell}<td><div class="table-actions">${action}</div></td>
+    <td><div class="table-actions">${action}</div></td>
   </tr>`;
 }
 
-function llmMovieRow(item, index) {
+function recommendationMovieRow(item, index) {
   return `<tr>
-    <td class="movie-title"><button type="button" class="movie-title-button" data-llm-details="${index}"><strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span></button></td>
+    <td class="movie-title"><button type="button" class="movie-title-button" data-modal-rec-details="${index}"><strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span></button></td>
     <td>${escapeHtml(text(item.release_date || item.year))}</td><td>${escapeHtml(text(item.directors))}</td>
-    <td>${escapeHtml(text(item.imdb_rating))}</td><td>${escapeHtml(text(item.kinopoisk_rating))}</td><td>${escapeHtml(text(item.genres))}</td>
-    <td class="cell-people">${escapeHtml(text(formatKeyPeople(item, true)))}</td><td>${escapeHtml(text(item.tmdb_id))}</td>
+    <td>${escapeHtml(movieRatings(item))}</td><td>${escapeHtml(text(item.countries))}</td><td>${escapeHtml(text(item.genres))}</td>
+    <td class="cell-people">${escapeHtml(text(formatKeyPeople(item, true)))}</td>
     <td class="cell-notes">${escapeHtml(text(item.notes))}</td>
     <td class="cell-links">${movieLinksHtml(item)}</td>
-    <td><div class="table-actions"><button type="button" class="mini-button done" data-llm-action="backlog" data-index="${index}">В бэклог</button><button type="button" class="mini-button like" data-llm-action="like" data-index="${index}">Нравится</button><button type="button" class="mini-button dislike" data-llm-action="dislike" data-index="${index}">Не нравится</button></div></td>
+    <td><div class="table-actions"><button type="button" class="mini-button done" data-modal-rec-action="backlog" data-index="${index}">В бэклог</button><button type="button" class="mini-button like" data-modal-rec-action="like" data-index="${index}">Нравится</button><button type="button" class="mini-button dislike" data-modal-rec-action="dislike" data-index="${index}">Не нравится</button></div></td>
   </tr>`;
 }
 
 function renderLlmRecommendations() {
   $("#backlog-recommend-body").innerHTML = state.llmItems.length
-    ? state.llmItems.map(llmMovieRow).join("")
-    : `<tr><td colspan="11" class="empty">Подходящих новых фильмов не найдено</td></tr>`;
+    ? state.llmItems.map(recommendationMovieRow).join("")
+    : `<tr><td colspan="10" class="empty">Подходящих новых фильмов не найдено</td></tr>`;
   const skipped = state.llmErrors.length;
   const summary = [`Уточнено фильмов: ${state.llmItems.length}.`];
   if (skipped) {
@@ -158,6 +162,21 @@ function renderLlmRecommendations() {
   }
   $("#backlog-recommend-message").textContent = summary.join(" ");
   $("#backlog-recommend-message").classList.toggle("error", !state.llmItems.length && skipped > 0);
+  showProviderWarnings(state.llmItems);
+}
+
+function renderApiRecommendations() {
+  $("#backlog-recommend-body").innerHTML = state.apiItems.length
+    ? state.apiItems.map(recommendationMovieRow).join("")
+    : `<tr><td colspan="10" class="empty">Новых фильмов по выбранным условиям нет</td></tr>`;
+  $("#backlog-recommend-message").textContent = `Найдено новых фильмов: ${state.apiItems.length}.`;
+  $("#backlog-recommend-message").classList.remove("error");
+  showProviderWarnings(state.apiItems);
+}
+
+function favoriteButton(item) {
+  const active = Boolean(item.favorite);
+  return `<button class="favorite-button ${active ? "active" : ""}" data-favorite-toggle data-id="${escapeHtml(item.id)}" aria-pressed="${active}" title="${active ? "Убрать из избранного" : "Добавить в избранное"}" aria-label="${active ? "Убрать из избранного" : "Добавить в избранное"}">${active ? "★" : "☆"}</button>`;
 }
 
 function ratedCard(item) {
@@ -168,13 +187,21 @@ function ratedCard(item) {
       <button class="mini-button like" data-reaction-toggle="like" data-id="${escapeHtml(item.id)}">${reaction === "like" ? "Убрать лайк" : "Нравится"}</button>
       <button class="mini-button dislike" data-reaction-toggle="dislike" data-id="${escapeHtml(item.id)}">${reaction === "dislike" ? "Убрать дизлайк" : "Не понравилось"}</button>
       <button class="mini-button" data-item-action="backlog" data-id="${escapeHtml(item.id)}">В бэклог</button>
+      ${favoriteButton(item)}
     </div>
+  </article>`;
+}
+
+function favoriteCard(item) {
+  return `<article class="rated-card favorite-card" data-card-id="${escapeHtml(item.id)}" tabindex="0">
+    <div class="favorite-card-head"><div><h3>${escapeHtml(title(item))}</h3><span class="rated-original">${escapeHtml(item.title_original)}</span></div>${favoriteButton(item)}</div>
+    <p>${escapeHtml(text(item.directors))} · ${escapeHtml(text(item.year))}</p>
   </article>`;
 }
 
 function renderLibrary() {
   const backlog = sortedBacklog(filtered(state.items.filter(item => item.status === "backlog")));
-  $("#backlog-body").innerHTML = backlog.map(item => movieRow(item, "backlog")).join("");
+  $("#backlog-body").innerHTML = backlog.map(movieRow).join("");
   $("#backlog-count").textContent = backlog.length; $("#backlog-empty").classList.toggle("hidden", backlog.length > 0); updateSortIndicators();
   const consumed = filtered(state.items.filter(item => item.status === "consumed"));
   const groups = { unrated: consumed.filter(x => !x.reaction), liked: consumed.filter(x => x.reaction === "like"), disliked: consumed.filter(x => x.reaction === "dislike") };
@@ -182,6 +209,10 @@ function renderLibrary() {
     $(`#${key}-list`).innerHTML = items.length ? items.map(ratedCard).join("") : `<div class="empty">Пусто</div>`;
     $(`#${key}-count`).textContent = items.length;
   }
+  const favorites = filtered(state.items.filter(item => item.favorite));
+  $("#favorites-list").innerHTML = favorites.map(favoriteCard).join("");
+  $("#favorites-count").textContent = favorites.length;
+  $("#favorites-empty").classList.toggle("hidden", favorites.length > 0);
 }
 
 function showDetails(item) {
@@ -205,6 +236,19 @@ function showDetails(item) {
 async function patchItem(id, changes) {
   const {item} = await request(`/api/library/${encodeURIComponent(id)}`, {method:"PATCH", body:JSON.stringify(changes)});
   state.items = state.items.map(existing => existing.id === item.id ? item : existing); renderLibrary(); toast("Фильмотека обновлена");
+}
+
+async function toggleFavorite(button) {
+  const item = state.items.find(movie => movie.id === button.dataset.id);
+  if (!item) return;
+  button.disabled = true;
+  try {
+    const result = await request(`/api/library/${encodeURIComponent(item.id)}/favorite`, {
+      method:"POST", body:JSON.stringify({favorite:!item.favorite}),
+    });
+    state.items = state.items.map(movie => movie.id === result.item.id ? result.item : movie);
+    renderLibrary(); toast(result.item.favorite ? "Добавлено в избранное" : "Удалено из избранного");
+  } catch (error) { button.disabled = false; toast(error.message); }
 }
 
 function renderPeople() {
@@ -246,12 +290,13 @@ function renderTrash() {
 
 function switchView(view) {
   state.view = view; document.querySelectorAll("[data-view]").forEach(button => button.classList.toggle("active", button.dataset.view === view));
-  $("#library-view").classList.toggle("hidden", !["backlog", "consumed"].includes(view)); $("#recommend-view").classList.toggle("hidden", view !== "recommend");
+  $("#library-view").classList.toggle("hidden", !["backlog", "consumed"].includes(view));
+  $("#favorites-view").classList.toggle("hidden", view !== "favorites");
   $("#people-view").classList.toggle("hidden", view !== "people"); $("#backlog-panel").classList.toggle("hidden", view !== "backlog"); $("#consumed-panel").classList.toggle("hidden", view !== "consumed");
   $("#trash-view").classList.toggle("hidden", view !== "trash");
-  $(".content-choice").classList.toggle("hidden", ["people", "trash"].includes(view)); $("#open-add").classList.toggle("hidden", !["backlog", "consumed"].includes(view)); $("#open-add-person").classList.toggle("hidden", view !== "people");
+  $(".content-choice").classList.toggle("hidden", ["people", "favorites", "trash"].includes(view)); $("#open-add").classList.toggle("hidden", !["backlog", "consumed"].includes(view)); $("#open-add-person").classList.toggle("hidden", view !== "people");
   $("#search").closest(".search").classList.toggle("hidden", view === "trash"); $("#search").placeholder = view === "people" ? "Найти персону" : "Найти фильм";
-  $("#page-title").textContent = ({backlog:"Бэклог", consumed:"Просмотрено", people:"Персоны", recommend:"Рекомендации", trash:"Корзина"})[view]; renderLibrary(); renderPeople(); renderTrash();
+  $("#page-title").textContent = ({backlog:"Бэклог", consumed:"Просмотрено", favorites:"Избранное", people:"Персоны", trash:"Корзина"})[view]; renderLibrary(); renderPeople(); renderTrash();
 }
 
 function renderInterestOptions() {
@@ -271,54 +316,18 @@ function updateSelectedLabels() {
   }
 }
 
-function recommendationValues() {
-  const data = new FormData($("#recommend-form"));
+function recommendationValues(form) {
+  const data = new FormData(form);
   const values = { actor_ids:data.getAll("actor_ids"), director_ids:data.getAll("director_ids"), limit:data.get("limit") };
-  for (const name of ["min_tmdb_rating", "min_imdb_rating", "min_votes", "min_runtime", "year_from", "excluded_genres"]) {
+  for (const name of ["min_imdb_rating", "min_kinopoisk_rating", "min_votes", "min_runtime", "year_from", "year_to", "excluded_genres"]) {
     if (data.has(name)) values[name] = data.get(name);
   }
   return values;
 }
 
-function buildPrompt(values) {
-  const actorBoxes = [...document.querySelectorAll('input[name="actor_ids"]')], directorBoxes = [...document.querySelectorAll('input[name="director_ids"]')];
-  const names = boxes => boxes.filter(box => box.checked).map(box => box.closest("label").textContent.trim()); const actors = names(actorBoxes), directors = names(directorBoxes);
-  const actorRule = actors.length === actorBoxes.length ? "все активные актёры из SQLite" : actors.join(", ") || "не использовать актёров как фильтр";
-  const directorRule = directors.length === directorBoxes.length ? "все активные режиссёры из SQLite" : directors.join(", ") || "не использовать режиссёров как фильтр";
-  const rules = ["фильмы уже вышли"];
-  if (values.year_from !== undefined) rules.push(`год выпуска >= ${values.year_from}`);
-  if (values.min_tmdb_rating !== undefined) rules.push(`TMDB rating >= ${values.min_tmdb_rating}`);
-  if (values.min_imdb_rating !== undefined) rules.push(`IMDb rating >= ${values.min_imdb_rating}`);
-  if (values.min_votes !== undefined) rules.push(`минимум ${values.min_votes} голосов TMDB`);
-  if (values.min_runtime !== undefined) rules.push(`длительность >= ${values.min_runtime} минут`);
-  if (values.excluded_genres !== undefined && values.excluded_genres.trim()) rules.push(`исключить жанры: ${values.excluded_genres}`);
-  rules.push(`актёры: ${actorRule}`, `режиссёры: ${directorRule}`, `количество: ${values.limit}`);
-  return `Используй $enrich-content-backlog и SQLite-базу data/library.sqlite3. Порекомендуй новые фильмы, исключив весь текущий бэклог, просмотренные фильмы, алиасы и дубли по TMDB ID/названию.\n\nФильтры:\n${rules.map(rule => `- ${rule}`).join("\n")}\n\nВерни таблицу: русское и оригинальное название, дата выхода, режиссёр, IMDb и Кинопоиск rating, жанры, ключевые персоны и ссылки IMDb/КП. Не изменяй SQLite без отдельной команды.`;
-}
-
-async function runRecommendation(event) {
-  event.preventDefault(); const values = recommendationValues(); if (state.mode === "llm") { $("#prompt-output").value = buildPrompt(values); return; }
-  const button = $("#recommend-action"); button.disabled = true; $("#api-message").classList.remove("error"); $("#api-message").textContent = "Получаю данные и исключаю фильмы, уже находящиеся в SQLite…"; $("#recommend-body").innerHTML = "";
-  try {
-    const payload = {...values};
-    if (values.year_from !== undefined) payload.date_from = `${values.year_from}-01-01`;
-    delete payload.year_from;
-    if (values.excluded_genres !== undefined) payload.excluded_genres = String(values.excluded_genres).split(",").map(x=>x.trim()).filter(Boolean);
-    const {items} = await request("/api/recommendations/tmdb", {method:"POST",body:JSON.stringify(payload)}); state.apiItems = items;
-    $("#api-message").textContent = items.length ? `Найдено новых фильмов: ${items.length}` : "Новых фильмов по выбранным условиям нет."; $("#recommend-body").innerHTML = items.map((item,index) => movieRow(item,"recommend",index)).join("");
-  } catch (error) { $("#api-message").textContent = error.message; $("#api-message").classList.add("error"); } finally { button.disabled = false; }
-}
-
-async function addRecommendation(index, action, button) {
-  button.disabled = true; const payload = {...state.apiItems[index]}; if (action === "backlog") { payload.status = "backlog"; payload.reaction = ""; } else { payload.status = "consumed"; payload.reaction = action; }
-  try {
-    const {item} = await request("/api/library", {method:"POST",body:JSON.stringify(payload)}); state.items.push(item); state.apiItems.splice(index,1);
-    $("#recommend-body").innerHTML = state.apiItems.map((movie,i)=>movieRow(movie,"recommend",i)).join(""); toast(action === "backlog" ? "Добавлено в бэклог" : "Добавлено в просмотренное");
-  } catch (error) { button.disabled = false; toast(error.message); }
-}
-
-async function addLlmRecommendation(index, action, button) {
-  const source = state.llmItems[index];
+async function addModalRecommendation(index, action, button) {
+  const items = state.backlogRecommendMode === "llm" ? state.llmItems : state.apiItems;
+  const source = items[index];
   if (!source) return;
   button.disabled = true;
   const payload = {...source};
@@ -326,14 +335,16 @@ async function addLlmRecommendation(index, action, button) {
   else { payload.status = "consumed"; payload.reaction = action; }
   try {
     const {item} = await request("/api/library", {method:"POST", body:JSON.stringify(payload)});
-    state.items.push(item); state.llmItems.splice(index, 1); renderLlmRecommendations(); renderLibrary();
+    state.items.push(item); items.splice(index, 1);
+    if (state.backlogRecommendMode === "llm") renderLlmRecommendations(); else renderApiRecommendations();
+    renderLibrary();
     toast(action === "backlog" ? "Добавлено в бэклог" : "Добавлено в просмотренное");
   } catch (error) { button.disabled = false; toast(error.message); }
 }
 
 async function refreshTmdb() {
-  const button = $("#refresh-tmdb"), notice = $("#refresh-progress"); button.disabled = true; notice.classList.remove("hidden","error"); notice.textContent = "Актуализирую фильмы и расширенные карточки…";
-  try { const result = await request("/api/library/refresh-tmdb", {method:"POST",body:"{}"}); state.items = (await request("/api/library?content_type=movie")).items; renderLibrary(); notice.textContent = `Обновлено ${result.updated} из ${result.total}. Ошибок: ${result.failed}.`; if (result.failed) notice.classList.add("error"); }
+  const button = $("#refresh-tmdb"), notice = $("#refresh-progress"); button.disabled = true; notice.classList.remove("hidden","error","warning"); notice.textContent = "Актуализирую фильмы и расширенные карточки…";
+  try { const result = await request("/api/library/refresh-tmdb", {method:"POST",body:"{}"}); state.items = (await request("/api/library?content_type=movie")).items; renderLibrary(); const warnings = providerWarnings([{provider_warnings:result.provider_warnings || []}]); notice.textContent = `Обновлено ${result.updated} из ${result.total}. Ошибок: ${result.failed}.${warnings.length ? ` ${warnings.join(" ")}` : ""}`; if (result.failed) notice.classList.add("error"); else if (warnings.length) notice.classList.add("warning"); if (warnings.length) toast(warnings[0]); }
   catch (error) { notice.textContent = error.message; notice.classList.add("error"); } finally { button.disabled = false; }
 }
 
@@ -348,7 +359,8 @@ async function refreshCurrentMovie() {
   const button = $("#refresh-detail"); button.disabled = true; button.textContent = "Обновляю…";
   try {
     const {item} = await request(`/api/library/${encodeURIComponent(state.currentDetailId)}/refresh-tmdb`, {method:"POST",body:"{}"});
-    state.items = state.items.map(existing => existing.id === item.id ? item : existing); renderLibrary(); showDetails(item); toast("Карточка обновлена из TMDB");
+    state.items = state.items.map(existing => existing.id === item.id ? item : existing); renderLibrary(); showDetails(item);
+    const warnings = providerWarnings([item]); toast(warnings[0] || "Карточка обновлена из TMDB");
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; button.textContent = "↻ Актуализировать из TMDB"; }
 }
@@ -365,14 +377,20 @@ async function refreshCurrentPerson() {
 }
 
 function formPayload(form) { return Object.fromEntries(new FormData(form).entries()); }
+function llmRecommendationPayload(form) {
+  return {
+    ...formPayload(form),
+    disabled_filters: [...form.querySelectorAll("[data-filter-field] input:disabled")].map(input => input.name),
+  };
+}
 function fillForm(form, values, fields) {
   for (const field of fields) {
     const control = form.elements.namedItem(field);
     if (control && values[field] !== undefined && values[field] !== null) control.value = values[field];
   }
 }
-function resolveStatus(selector, message = "", isError = false) {
-  const node = $(selector); node.textContent = message; node.classList.toggle("hidden", !message); node.classList.toggle("error", isError);
+function resolveStatus(selector, message = "", isError = false, isWarning = false) {
+  const node = $(selector); node.textContent = message; node.classList.toggle("hidden", !message); node.classList.toggle("error", isError); node.classList.toggle("warning", isWarning);
 }
 function resetMovieDraft() {
   $("#add-form").reset();
@@ -408,7 +426,9 @@ async function resolveMovieDraft() {
     const {item} = await request("/api/resolve/movie", {method:"POST", body:JSON.stringify(draft)});
     state.pendingMovieDetails = item; fillForm(form, item, ["title_original", "title_ru", "year", "directors"]);
     state.pendingMovieSearchField = ""; $("#add-movie-links").innerHTML = movieDraftLinksHtml(item); renderMovieDraftPreview(item);
-    resolveStatus("#add-resolve-status", `Найдено: ${item.title_ru || item.title_original}${item.year ? ` (${item.year})` : ""}. Исходный ввод сохранится в Raw.`);
+    const warnings = providerWarnings([item]);
+    resolveStatus("#add-resolve-status", `Найдено: ${item.title_ru || item.title_original}${item.year ? ` (${item.year})` : ""}. Исходный ввод сохранится в Raw.${warnings.length ? ` ${warnings.join(" ")}` : ""}`, false, warnings.length > 0);
+    if (warnings.length) toast(warnings[0]);
   } catch (error) { resolveStatus("#add-resolve-status", error.message, true); }
   finally { button.disabled = false; button.textContent = "↻ Актуализировать из TMDB"; }
 }
@@ -446,27 +466,61 @@ async function restoreFromTrash(button) {
   } catch (error) { button.disabled = false; toast(error.message); }
 }
 
+function setBacklogRecommendMode(mode) {
+  state.backlogRecommendMode = mode;
+  document.querySelectorAll("[data-backlog-recommend-mode]").forEach(button => button.classList.toggle("active", button.dataset.backlogRecommendMode === mode));
+  $("#backlog-recommend-form").classList.toggle("hidden", mode !== "llm");
+  $("#backlog-api-form").classList.toggle("hidden", mode !== "api");
+  $("#backlog-recommend-result").classList.add("hidden");
+  $("#backlog-recommend-warning").classList.add("hidden");
+  $("#backlog-recommend-error").textContent = ""; $("#backlog-api-error").textContent = "";
+}
+
 function openBacklogRecommendation() {
-  const currentYear = new Date().getFullYear(), yearTo = $("#backlog-year-to");
-  yearTo.max = String(currentYear + 2); yearTo.value = String(currentYear);
-  state.llmItems = []; state.llmErrors = [];
+  const currentYear = new Date().getFullYear();
+  for (const yearTo of [$("#backlog-year-to"), $("#api-year-to")]) {
+    yearTo.max = String(currentYear + 2); yearTo.value = String(currentYear);
+  }
+  state.llmItems = []; state.apiItems = []; state.llmErrors = [];
   $("#backlog-recommend-error").textContent = ""; $("#backlog-recommend-result").classList.add("hidden"); $("#backlog-recommend-body").innerHTML = ""; $("#backlog-recommend-message").textContent = "";
   const provider = state.llm.provider || "Codex SDK", model = state.llm.model ? ` · ${state.llm.model}` : "";
   $("#backlog-recommend-provider").textContent = `${provider}${model}${state.llm.configured === false ? " · требуется установка" : ""}`;
+  $("#backlog-api-provider").textContent = state.tmdb.configured ? `TMDB · подключён${state.tmdb.omdb_configured ? " · OMDb" : ""}${state.tmdb.kinopoisk_configured ? " · КП" : ""}` : "TMDB · нужен ключ";
+  setBacklogRecommendMode("llm");
   $("#backlog-recommend-dialog").showModal();
 }
 
 async function runBacklogRecommendation(event) {
   event.preventDefault();
   const button = $("#backlog-recommend-submit"), errorNode = $("#backlog-recommend-error"), resultNode = $("#backlog-recommend-result");
-  button.disabled = true; button.textContent = "Подбираю и уточняю…"; errorNode.textContent = ""; resultNode.classList.add("hidden");
+  button.disabled = true; button.textContent = "Подбираю и уточняю…"; errorNode.textContent = ""; resultNode.classList.add("hidden"); $("#backlog-recommend-warning").classList.add("hidden");
   try {
-    const payload = formPayload(event.currentTarget);
+    const payload = llmRecommendationPayload(event.currentTarget);
     const result = await request("/api/recommendations/llm", {method:"POST", body:JSON.stringify(payload)});
     state.llmItems = result.items || []; state.llmErrors = result.errors || []; renderLlmRecommendations();
+    $("#backlog-recommend-result-source").textContent = "Codex + TMDB + OMDb + Кинопоиск";
     $("#backlog-recommend-model").textContent = result.model || "Codex"; resultNode.classList.remove("hidden");
   } catch (error) { errorNode.textContent = error.message; }
   finally { button.disabled = false; button.textContent = "Порекомендовать"; }
+}
+
+async function runBacklogApiRecommendation(event) {
+  event.preventDefault();
+  const button = $("#backlog-api-submit"), errorNode = $("#backlog-api-error"), resultNode = $("#backlog-recommend-result");
+  button.disabled = true; button.textContent = "Ищу и уточняю…"; errorNode.textContent = ""; resultNode.classList.add("hidden"); $("#backlog-recommend-warning").classList.add("hidden");
+  try {
+    const values = recommendationValues(event.currentTarget), payload = {...values};
+    if (values.year_from !== undefined) payload.date_from = `${values.year_from}-01-01`;
+    if (values.year_to !== undefined) payload.date_to = `${values.year_to}-12-31`;
+    delete payload.year_from;
+    delete payload.year_to;
+    if (values.excluded_genres !== undefined) payload.excluded_genres = String(values.excluded_genres).split(",").map(value => value.trim()).filter(Boolean);
+    const {items} = await request("/api/recommendations/tmdb", {method:"POST", body:JSON.stringify(payload)});
+    state.apiItems = items || []; renderApiRecommendations();
+    $("#backlog-recommend-result-source").textContent = "TMDB + OMDb + Кинопоиск";
+    $("#backlog-recommend-model").textContent = "TMDB API"; resultNode.classList.remove("hidden");
+  } catch (error) { errorNode.textContent = error.message; }
+  finally { button.disabled = false; button.textContent = "Найти фильмы"; }
 }
 
 document.addEventListener("click", async event => {
@@ -477,14 +531,13 @@ document.addEventListener("click", async event => {
   const restore = event.target.closest("[data-restore-id]"); if (restore) { await restoreFromTrash(restore); return; }
   const details = event.target.closest("[data-details-id]"); if (details) { showDetails(state.items.find(item=>item.id===details.dataset.detailsId)); return; }
   const personDetails = event.target.closest("[data-person-details-id]"); if (personDetails) { showPersonDetails(state.interests.find(item=>item.id===personDetails.dataset.personDetailsId)); return; }
-  const recDetails = event.target.closest("[data-rec-details]"); if (recDetails) { showDetails(state.apiItems[Number(recDetails.dataset.recDetails)]); return; }
-  const llmDetails = event.target.closest("[data-llm-details]"); if (llmDetails) { showDetails(state.llmItems[Number(llmDetails.dataset.llmDetails)]); return; }
+  const modalRecDetails = event.target.closest("[data-modal-rec-details]"); if (modalRecDetails) { const items=state.backlogRecommendMode === "llm" ? state.llmItems : state.apiItems; showDetails(items[Number(modalRecDetails.dataset.modalRecDetails)]); return; }
   const itemAction = event.target.closest("[data-item-action]"); if (itemAction) { const action=itemAction.dataset.itemAction; await patchItem(itemAction.dataset.id,action === "backlog" ? {status:"backlog"} : {status:"consumed",reaction:action}); return; }
   const reaction = event.target.closest("[data-reaction-toggle]"); if (reaction) { const item=state.items.find(x=>x.id===reaction.dataset.id); const next=item.reaction===reaction.dataset.reactionToggle ? "" : reaction.dataset.reactionToggle; await patchItem(item.id,{reaction:next}); return; }
-  const rec = event.target.closest("[data-rec-action]"); if (rec) { await addRecommendation(Number(rec.dataset.index),rec.dataset.recAction,rec); return; }
-  const llmAction = event.target.closest("[data-llm-action]"); if (llmAction) { await addLlmRecommendation(Number(llmAction.dataset.index),llmAction.dataset.llmAction,llmAction); return; }
+  const favorite = event.target.closest("[data-favorite-toggle]"); if (favorite) { await toggleFavorite(favorite); return; }
+  const modalRecAction = event.target.closest("[data-modal-rec-action]"); if (modalRecAction) { await addModalRecommendation(Number(modalRecAction.dataset.index),modalRecAction.dataset.modalRecAction,modalRecAction); return; }
   const card = event.target.closest("[data-card-id]"); if (card) { showDetails(state.items.find(item=>item.id===card.dataset.cardId)); return; }
-  const mode = event.target.closest("[data-mode]"); if (mode) { state.mode=mode.dataset.mode; document.querySelectorAll("[data-mode]").forEach(x=>x.classList.toggle("active",x===mode)); $("#llm-result").classList.toggle("hidden",state.mode!=="llm"); $("#api-result").classList.toggle("hidden",state.mode!=="api"); $("#recommend-action").textContent=state.mode==="api"?"Обновить рекомендации":"Подготовить промпт"; }
+  const recommendMode = event.target.closest("[data-backlog-recommend-mode]"); if (recommendMode) { setBacklogRecommendMode(recommendMode.dataset.backlogRecommendMode); return; }
   const filterToggle = event.target.closest("[data-filter-toggle]"); if (filterToggle) { const field=filterToggle.closest("[data-filter-field]"); const input=field.querySelector("input"); input.disabled=!input.disabled; field.classList.toggle("filter-disabled",input.disabled); filterToggle.setAttribute("aria-pressed",String(!input.disabled)); filterToggle.textContent=input.disabled?"—":"✓"; filterToggle.setAttribute("aria-label",`${input.disabled?"Включить":"Отключить"} фильтр ${field.dataset.filterLabel}`); }
 });
 
@@ -495,11 +548,11 @@ document.addEventListener("keydown", event => {
   const person=event.target.closest("[data-person-details-id]"); if (person) { event.preventDefault(); showPersonDetails(state.interests.find(item=>item.id===person.dataset.personDetailsId)); }
 });
 document.addEventListener("change", event => { const all=event.target.closest("[data-select-all]"); if (all) document.querySelectorAll(`input[name="${all.dataset.selectAll}_ids"]`).forEach(box=>box.checked=all.checked); if (all || event.target.matches('input[name="actor_ids"],input[name="director_ids"]')) updateSelectedLabels(); });
-document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => { const rect=dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); }));
+document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => { if (dialog.id === "backlog-recommend-dialog") return; const rect=dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); }));
+$("#backlog-recommend-dialog").addEventListener("cancel", event => event.preventDefault());
 
 $("#search").addEventListener("input", event => { state.query=event.target.value; renderLibrary(); renderPeople(); }); $("#refresh-tmdb").addEventListener("click", refreshTmdb); $("#refresh-people").addEventListener("click", refreshPeople); $("#refresh-detail").addEventListener("click", refreshCurrentMovie); $("#refresh-person-detail").addEventListener("click", refreshCurrentPerson);
-$("#recommend-form").addEventListener("submit", runRecommendation); $("#copy-prompt").addEventListener("click", async()=>{ if(!$("#prompt-output").value)return; await navigator.clipboard.writeText($("#prompt-output").value); toast("Промпт скопирован"); });
-$("#open-backlog-recommend").addEventListener("click", openBacklogRecommendation); $("#backlog-recommend-form").addEventListener("submit", runBacklogRecommendation);
+$("#open-backlog-recommend").addEventListener("click", openBacklogRecommendation); $("#backlog-recommend-form").addEventListener("submit", runBacklogRecommendation); $("#backlog-api-form").addEventListener("submit", runBacklogApiRecommendation);
 $("#open-add").addEventListener("click",()=>{ resetMovieDraft(); $("#add-dialog").showModal(); $("#add-form").elements.namedItem("title_ru").focus(); });
 $("#open-add-person").addEventListener("click",()=>{ state.pendingPersonDetails=null;state.pendingPersonRaw=null;$("#add-person-form").reset();resolveStatus("#add-person-resolve-status");$("#add-person-error").textContent="";$("#add-person-dialog").showModal(); });
 $("#resolve-movie").addEventListener("click", resolveMovieDraft); $("#resolve-person").addEventListener("click", resolvePersonDraft);
@@ -520,7 +573,7 @@ $("#add-form").addEventListener("submit", event => { event.preventDefault(); sav
 $("#add-person-form").addEventListener("submit",async event=>{ event.preventDefault(); const form=event.currentTarget,current=formPayload(form); const payload={...(state.pendingPersonDetails||{}),...current,raw_data:state.pendingPersonRaw||compactObject(current)}; try{ const {item}=await request("/api/people",{method:"POST",body:JSON.stringify(payload)});state.interests.push(item);form.reset();state.pendingPersonDetails=null;state.pendingPersonRaw=null;$("#add-person-error").textContent="";$("#add-person-dialog").close();renderPeople();renderInterestOptions();toast("Персона добавлена");}catch(error){$("#add-person-error").textContent=error.message;} });
 
 async function initialize() {
-  try { const [{items},meta,trash]=await Promise.all([request("/api/library?content_type=movie"),request("/api/meta"),request("/api/trash")]); state.items=items;state.interests=meta.interests;state.trash=trash.items;state.tmdb=meta.tmdb;state.llm=meta.llm||{}; $("#api-status").textContent=meta.tmdb.configured?`TMDB · подключён${meta.tmdb.omdb_configured?" · OMDb":""}${meta.tmdb.kinopoisk_configured?" · КП":""}`:"TMDB · нужен ключ"; renderInterestOptions();renderLibrary();renderPeople();renderTrash(); }
+  try { const [{items},meta,trash]=await Promise.all([request("/api/library?content_type=movie"),request("/api/meta"),request("/api/trash")]); state.items=items;state.interests=meta.interests;state.trash=trash.items;state.tmdb=meta.tmdb;state.llm=meta.llm||{}; renderInterestOptions();renderLibrary();renderPeople();renderTrash(); }
   catch(error){toast(error.message);}
 }
 initialize();

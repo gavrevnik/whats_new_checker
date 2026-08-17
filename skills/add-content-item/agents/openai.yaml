@@ -1,4 +1,0 @@
-interface:
-  display_name: "Добавить в библиотеку"
-  short_description: "Распознать и добавить единицу контента"
-  default_prompt: "Используй $add-content-item, чтобы добавить эту рекомендацию в мою библиотеку."

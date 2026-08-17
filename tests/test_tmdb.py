@@ -89,6 +89,19 @@ class TmdbTests(unittest.TestCase):
         self.assertEqual(result["kinopoisk_id"], 256408)
         self.assertEqual(result["kinopoisk_rating"], 6.6)
 
+    def test_kinopoisk_quota_error_becomes_non_fatal_warning(self) -> None:
+        with patch.object(tmdb,"get_kinopoisk_key",return_value=("kp-key","test")), \
+             patch.object(tmdb,"_request_json",side_effect=tmdb.TmdbError("Provider returned HTTP 402: quota exceeded")):
+            result = tmdb._get_kinopoisk("tt0478304","The Tree of Life","Древо жизни",2011)
+        self.assertNotIn("kinopoisk_rating", result)
+        self.assertEqual(result["provider_warnings"][0]["kind"], "limit")
+        self.assertIn("лимит", result["provider_warnings"][0]["message"])
+
+    def test_tmdb_provider_error_remains_fatal_and_is_labeled(self) -> None:
+        with patch.object(tmdb,"_request_json",side_effect=tmdb.TmdbError("Provider returned HTTP 429: limit")):
+            with self.assertRaisesRegex(tmdb.TmdbError, "^TMDB:"):
+                tmdb._get("/movie/1", {"language":"ru-RU"}, "key")
+
     def test_person_details_uses_canonical_and_russian_alias(self) -> None:
         payload = {
             "id":514, "name":"Jack Nicholson", "also_known_as":["Джек Николсон"],
@@ -167,6 +180,39 @@ class TmdbTests(unittest.TestCase):
              patch.object(tmdb.storage,"update_movie_from_provider",return_value=target):
             tmdb.refresh_movie("movie-one")
         fetch.assert_called_once_with(603, "key", fetch_kinopoisk=False)
+
+    def test_api_recommendations_apply_year_and_translated_genres_before_enrichment(self) -> None:
+        credits = {"cast":[
+            {"id":1,"title":"Документальный","original_title":"Documentary","release_date":"2024-01-01","genre_ids":[99],"vote_average":9,"vote_count":500},
+            {"id":2,"title":"Анимация","original_title":"Animation","release_date":"2023-01-01","genre_ids":[16],"vote_average":9,"vote_count":500},
+            {"id":3,"title":"Драма","original_title":"Drama","release_date":"2024-06-01","genre_ids":[18],"vote_average":1,"vote_count":500},
+            {"id":4,"title":"Будущее","original_title":"Future","release_date":"2027-01-01","genre_ids":[18],"vote_average":9,"vote_count":500},
+        ]}
+        details = {"tmdb_id":3,"title_ru":"Драма","title_original":"Drama","year":"2024","duration_minutes":120,"imdb_rating":7,"genres":"драма"}
+        interests = lambda _content, role: [{"id":"actor-one","external_id":10,"role":"actor"}] if role == "actor" else []
+        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb.storage,"list_interests",side_effect=interests), \
+             patch.object(tmdb.storage,"known_movie_keys",return_value=(set(),set())), \
+             patch.object(tmdb,"_get",return_value=credits), \
+             patch.object(tmdb,"movie_details",return_value=details) as enrich:
+            result = tmdb.recommend_movies({
+                "actor_ids":["actor-one"], "date_from":"2020-01-01", "date_to":"2025-12-31",
+                "excluded_genres":["Animation","Documentary"], "min_tmdb_rating":9, "limit":20,
+            })
+        self.assertEqual([item["tmdb_id"] for item in result], [3])
+        enrich.assert_called_once_with(3, "key")
+
+    def test_api_recommendations_filter_by_kinopoisk_rating(self) -> None:
+        credits = {"cast":[{"id":3,"title":"Драма","original_title":"Drama","release_date":"2024-06-01","genre_ids":[18],"vote_average":8,"vote_count":500}]}
+        details = {"tmdb_id":3,"title_ru":"Драма","title_original":"Drama","year":"2024","duration_minutes":120,"imdb_rating":7,"kinopoisk_rating":6.5,"genres":"драма"}
+        interests = lambda _content, role: [{"id":"actor-one","external_id":10,"role":"actor"}] if role == "actor" else []
+        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb.storage,"list_interests",side_effect=interests), \
+             patch.object(tmdb.storage,"known_movie_keys",return_value=(set(),set())), \
+             patch.object(tmdb,"_get",return_value=credits), \
+             patch.object(tmdb,"movie_details",return_value=details):
+            result = tmdb.recommend_movies({"actor_ids":["actor-one"],"min_kinopoisk_rating":7})
+        self.assertEqual(result, [])
 
 
 if __name__ == "__main__":
