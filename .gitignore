@@ -12,3 +12,4 @@ __pycache__/
 .venv/
 node_modules/
 data/settings.json
+/data/artwork/

@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from app import storage
+from app import artwork, storage
 
 
 class StorageTests(unittest.TestCase):
@@ -60,13 +60,84 @@ class StorageTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertTrue({"content_items","movies","people","interest_roles","movie_people","genres","content_aliases","trash_entries","favorite_movies"} <= tables)
+        self.assertTrue({"content_items","movies","albums","music_artists","album_artists","people","interest_roles","movie_people","genres","content_aliases","trash_entries","favorite_movies"} <= tables)
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertIn("raw_json", {row[1] for row in connection.execute("PRAGMA table_info(content_items)")})
             self.assertIn("raw_json", {row[1] for row in connection.execute("PRAGMA table_info(people)")})
             movie_columns = {row[1] for row in connection.execute("PRAGMA table_info(movies)")}
             self.assertIn("kinopoisk_id", movie_columns)
             self.assertIn("kinopoisk_rating", movie_columns)
+            self.assertIn("poster_path", movie_columns)
+            self.assertIn("poster_url", movie_columns)
+            self.assertIn("poster_local_path", movie_columns)
+            album_columns = {row[1] for row in connection.execute("PRAGMA table_info(albums)")}
+            self.assertIn("cover_url", album_columns)
+            self.assertIn("cover_path", album_columns)
+            self.assertIn("cover_art_updated_at", album_columns)
+            self.assertIn("total_listen_count", album_columns)
+            self.assertIn("listenbrainz_updated_at", album_columns)
+            self.assertNotIn("rating", album_columns)
+            self.assertNotIn("rating_votes", album_columns)
+
+    def test_album_artist_workflow_and_trash_restore(self) -> None:
+        artist = storage.add_music_artist({
+            "content_type":"music", "name":"Chelsea Wolfe", "mbid":"artist-mbid",
+            "artist_type":"Person", "country":"US",
+        })
+        created = storage.add_item({
+            "content_type":"music", "title_original":"She Reaches Out to She Reaches Out to She",
+            "title_ru":"She Reaches Out to She Reaches Out to She", "year":"2024",
+            "first_release_date":"2024-02-09", "release_group_mbid":"album-mbid",
+            "track_count":10, "genres_data":[{"name":"darkwave","count":3}],
+            "cover_url":"https://coverartarchive.org/release-group/album-mbid/front-500",
+            "total_listen_count":12345,
+            "artists_data":[{"name":"Chelsea Wolfe","mbid":"artist-mbid"}],
+        })
+        self.assertEqual(created["artists"], "Chelsea Wolfe")
+        self.assertEqual(created["track_count"], 10)
+        self.assertEqual(created["genres"], "darkwave")
+        self.assertEqual(created["musicbrainz_link"], "https://musicbrainz.org/release-group/album-mbid")
+        self.assertEqual(created["cover_url"], "https://coverartarchive.org/release-group/album-mbid/front-500")
+        self.assertEqual(created["total_listen_count"], 12345)
+        liked = storage.update_item(created["id"], {"status":"consumed", "reaction":"like"})
+        self.assertEqual(liked["reaction"], "like")
+        trashed = storage.trash_entity({"entity_type":"album", "entity_id":created["id"]})
+        self.assertEqual(storage.list_library(content_type="music"), [])
+        storage.restore_trash(trashed["id"])
+        self.assertEqual(storage.list_library(content_type="music")[0]["id"], created["id"])
+        artist_trash = storage.trash_entity({"entity_type":"music_artist", "entity_id":artist["id"]})
+        self.assertEqual(storage.list_music_artists(), [])
+        storage.restore_trash(artist_trash["id"])
+        self.assertEqual(storage.list_music_artists()[0]["mbid"], "artist-mbid")
+
+    def test_album_provider_refresh_preserves_workflow(self) -> None:
+        created = storage.add_item({
+            "content_type":"music", "title_original":"Album", "title_ru":"Album",
+            "status":"consumed", "reaction":"dislike", "release_group_mbid":"rg-1",
+            "artists":"Artist",
+        })
+        updated = storage.update_album_from_provider(created["id"], {
+            "title_original":"Album", "title_ru":"Album", "release_group_mbid":"rg-1",
+            "first_release_date":"2024-01-01", "track_count":8, "artists":"Artist",
+            "details_json":{"track_list":[{"number":"1","title":"Opening"}]},
+        })
+        self.assertEqual(updated["status"], "consumed")
+        self.assertEqual(updated["reaction"], "dislike")
+        self.assertEqual(updated["track_count"], 8)
+        self.assertEqual(updated["track_list"][0]["title"], "Opening")
+
+    def test_album_refresh_preserves_cover_after_transient_cover_art_error(self) -> None:
+        cover_url = "https://coverartarchive.org/release-group/rg-cover/front-500"
+        created = storage.add_item({
+            "content_type":"music", "title_original":"Test Album", "title_ru":"Test Album",
+            "artists":"Test Artist", "release_group_mbid":"rg-cover", "year":2026,
+            "cover_url":cover_url, "cover_art_checked":True,
+        })
+        updated = storage.update_album_from_provider(created["id"], {
+            "release_group_mbid":"rg-cover", "title_original":"Test Album",
+            "cover_url":"", "cover_art_checked":False,
+        })
+        self.assertEqual(updated["cover_url"], cover_url)
 
     def test_favorite_is_independent_from_status_and_reaction(self) -> None:
         created = storage.add_item({
@@ -128,6 +199,19 @@ class StorageTests(unittest.TestCase):
         })
         self.assertEqual(refreshed["kinopoisk_rating"], 7.4)
 
+    def test_rating_only_refresh_preserves_existing_movie_data(self) -> None:
+        created = storage.add_item({
+            "content_type":"movie", "title_original":"Movie", "title_ru":"Фильм",
+            "year":2024, "imdb_rating":8.1, "overview":"Описание", "tmdb_id":10,
+        })
+        updated = storage.update_movie_ratings(created["id"], {
+            "kinopoisk_rating":7.9, "kinopoisk_id":20,
+        })
+        self.assertEqual(updated["imdb_rating"], 8.1)
+        self.assertEqual(updated["kinopoisk_rating"], 7.9)
+        self.assertEqual(updated["title_ru"], "Фильм")
+        self.assertEqual(updated["overview"], "Описание")
+
     def test_movie_raw_input_and_trash_restore(self) -> None:
         raw = {"title_ru":"сияние", "year":"1980"}
         created = storage.add_item({
@@ -156,6 +240,80 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(storage.list_trash()[0]["role"], "actor")
         storage.restore_trash(trashed["id"])
         self.assertTrue(any(item["id"] == created["id"] for item in storage.list_interests("movie")))
+
+    def test_empty_trash_deletes_entities_and_unreferenced_artwork(self) -> None:
+        artwork_dir = Path(self.temp.name) / "artwork"
+        deleted_poster = artwork_dir / "movies" / "deleted.jpg"
+        shared_poster = artwork_dir / "movies" / "shared.jpg"
+        deleted_cover = artwork_dir / "albums" / "deleted.jpg"
+        for path in (deleted_poster, shared_poster, deleted_cover):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"image")
+
+        kept_movie = storage.add_item({
+            "content_type":"movie", "title_original":"Kept movie", "title_ru":"Kept movie",
+            "poster_local_path":"movies/shared.jpg",
+        })
+        deleted_movie = storage.add_item({
+            "content_type":"movie", "title_original":"Deleted movie", "title_ru":"Deleted movie",
+            "poster_local_path":"movies/deleted.jpg",
+        })
+        shared_art_movie = storage.add_item({
+            "content_type":"movie", "title_original":"Shared artwork movie", "title_ru":"Shared artwork movie",
+            "poster_local_path":"movies/shared.jpg",
+        })
+        deleted_album = storage.add_item({
+            "content_type":"music", "title_original":"Deleted album", "title_ru":"Deleted album",
+            "release_group_mbid":"deleted-rg", "cover_path":"albums/deleted.jpg",
+        })
+        artist = storage.add_music_artist({"name":"Kept album artist", "mbid":"artist-kept"})
+        kept_album = storage.add_item({
+            "content_type":"music", "title_original":"Kept album", "title_ru":"Kept album",
+            "release_group_mbid":"kept-rg",
+            "artists_data":[{"name":"Kept album artist", "mbid":"artist-kept"}],
+        })
+        with storage.connect() as connection:
+            connection.execute(
+                "INSERT INTO interest_roles(person_id,content_type,role) VALUES ('nolan','movie','actor')"
+            )
+
+        storage.trash_entity({"entity_type":"movie", "entity_id":deleted_movie["id"]})
+        storage.trash_entity({"entity_type":"movie", "entity_id":shared_art_movie["id"]})
+        storage.trash_entity({"entity_type":"album", "entity_id":deleted_album["id"]})
+        storage.trash_entity({"entity_type":"music_artist", "entity_id":artist["id"]})
+        storage.trash_entity({"entity_type":"person", "entity_id":"nolan", "role":"actor"})
+
+        with patch.object(artwork, "ARTWORK_DIR", artwork_dir):
+            result = storage.empty_trash()
+
+        self.assertEqual(result["deleted"], 5)
+        self.assertEqual(result["artwork_deleted"], 2)
+        self.assertEqual(result["artwork_errors"], [])
+        self.assertEqual(storage.list_trash(), [])
+        self.assertEqual([item["id"] for item in storage.list_library("movie")], [kept_movie["id"]])
+        self.assertEqual([item["id"] for item in storage.list_library("music")], [kept_album["id"]])
+        self.assertFalse(deleted_poster.exists())
+        self.assertFalse(deleted_cover.exists())
+        self.assertTrue(shared_poster.exists())
+        self.assertEqual(storage.list_music_artists(), [])
+        with storage.connect() as connection:
+            self.assertEqual(
+                connection.execute("SELECT active FROM music_artists WHERE id = ?", (artist["id"],)).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM album_artists WHERE album_id = ?", (kept_album["id"],)).fetchone()[0],
+                1,
+            )
+            roles = {
+                row[0] for row in connection.execute(
+                    "SELECT role FROM interest_roles WHERE person_id = 'nolan'"
+                ).fetchall()
+            }
+        self.assertEqual(roles, {"director"})
+
+    def test_empty_trash_is_a_noop_when_already_empty(self) -> None:
+        self.assertEqual(storage.empty_trash()["deleted"], 0)
 
 
 if __name__ == "__main__":

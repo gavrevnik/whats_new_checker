@@ -172,6 +172,46 @@ class LlmTests(unittest.TestCase):
         self.assertEqual(result["items"], [])
         self.assertEqual(result["errors"], [])
 
+    def test_album_prompt_contains_liked_albums_artists_and_backlog(self) -> None:
+        storage.add_music_artist({"content_type":"music", "name":"The Smile", "mbid":"artist-1"})
+        storage.add_item({
+            "content_type":"music", "title_original":"Wall of Eyes", "title_ru":"Wall of Eyes",
+            "artists":"The Smile", "year":"2024", "status":"consumed", "reaction":"like",
+            "release_group_mbid":"rg-liked",
+        })
+        storage.add_item({
+            "content_type":"music", "title_original":"Cutouts", "title_ru":"Cutouts",
+            "artists":"The Smile", "year":"2024", "status":"backlog",
+            "release_group_mbid":"rg-backlog",
+        })
+        prompt = llm.build_album_prompt({"prompt":"Хочу арт-рок", "year_from":"2023", "year_to":"2026"})
+        self.assertIn("Wall of Eyes", prompt)
+        self.assertIn("Cutouts", prompt)
+        self.assertIn("The Smile", prompt)
+        self.assertIn("Хочу арт-рок", prompt)
+        self.assertIn("массивом albums", prompt)
+
+    def test_album_recommendation_is_enriched_through_musicbrainz(self) -> None:
+        response = {"albums":[{"title":"Album","artist":"Artist","year":2024,"comment":"Подходит"}]}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(response, ensure_ascii=False), "")
+        details = {
+            "content_type":"music", "title_original":"Album", "title_ru":"Album",
+            "artists":"Artist", "year":2024, "release_group_mbid":"rg-1", "track_count":9,
+        }
+        with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
+             patch.object(llm, "get_model", return_value="test-model"), \
+             patch.object(llm.subprocess, "run", return_value=completed) as run, \
+             patch.object(llm.musicbrainz, "search_album", return_value=details), \
+             patch.object(llm.musicbrainz, "album_details", return_value=details) as album_details, \
+             patch.object(llm.listenbrainz, "enrich_albums", side_effect=lambda items: items) as popularity:
+            result = llm.recommend_albums({"year_from":"2023", "year_to":"2026", "limit":"1"})
+        self.assertEqual(result["items"][0]["release_group_mbid"], "rg-1")
+        self.assertEqual(result["items"][0]["notes"], "Подходит")
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--schema") + 1], str(llm.ALBUM_SCHEMA_PATH))
+        album_details.assert_called_once_with("rg-1", fetch_popularity=False)
+        popularity.assert_called_once_with(result["items"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Any
 
-from app import storage
+from app import artwork, recommendation_progress, storage
 from app.storage import ROOT, _normalized
 
 
@@ -358,7 +358,7 @@ def movie_details(
         key_parts.append(f"Актёры: {key_actors}")
     if key_directors:
         key_parts.append(f"Режиссёры: {key_directors}")
-    return {
+    payload = {
         "content_type": "movie",
         "title_ru": str(details.get("title") or ""),
         "title_original": str(details.get("original_title") or ""),
@@ -396,13 +396,27 @@ def movie_details(
         "budget": int(details.get("budget") or 0),
         "revenue": int(details.get("revenue") or 0),
         "homepage": str(details.get("homepage") or ""),
-        "poster_url": f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else "",
+        "poster_path": poster_path,
+        "poster_url": artwork.movie_poster_url(poster_path),
         "movie_status": str(details.get("status") or ""),
         "url": f"https://www.themoviedb.org/movie/{details['id']}",
         "source": "tmdb",
         "status": "backlog",
         "reaction": "",
     }
+    if poster_path:
+        try:
+            payload["poster_local_path"] = artwork.cache_movie_poster(
+                details["id"], poster_path, payload["poster_url"]
+            )
+        except artwork.ArtworkError as error:
+            payload["poster_local_path"] = ""
+            payload.setdefault("provider_warnings", []).append({
+                "provider": "tmdb-images", "message": str(error)
+            })
+    else:
+        payload["poster_local_path"] = ""
+    return payload
 
 
 def _cyrillic_alias(values: list[Any]) -> str:
@@ -576,19 +590,125 @@ def resolve_movie_input(payload: dict[str, Any]) -> dict[str, Any]:
     return movie_details(tmdb_id, api_key)
 
 
-def refresh_library() -> dict[str, Any]:
-    api_key, _ = get_api_key()
-    if not api_key:
-        raise TmdbError("TMDB_API_KEY is not configured")
-    targets = storage.movie_refresh_targets()
-
-    def fetch(target: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _movie_rating_details(target: dict[str, Any]) -> dict[str, Any]:
+    needs_imdb = target.get("imdb_rating") in (None, "")
+    needs_kinopoisk = target.get("kinopoisk_rating") in (None, "")
+    if not needs_imdb and not needs_kinopoisk:
+        return {}
+    details: dict[str, Any] = {}
+    imdb_id = str(target.get("imdb_id") or "")
+    if needs_imdb and not imdb_id:
+        api_key, _ = get_api_key()
+        if not api_key:
+            raise TmdbError("TMDB_API_KEY is not configured")
         tmdb_id = target.get("tmdb_id")
         if not str(tmdb_id).isdigit():
-            tmdb_id = resolve_movie(target["title_original"], target["title_ru"], target["year"], api_key)
-        return target["id"], movie_details(
-            int(tmdb_id), api_key, fetch_kinopoisk=target.get("kinopoisk_rating") in (None, ""),
+            tmdb_id = resolve_movie(
+                str(target.get("title_original") or ""),
+                str(target.get("title_ru") or ""),
+                target.get("year"), api_key,
+            )
+        basic = _get(f"/movie/{int(tmdb_id)}", {"language": "en-US"}, api_key)
+        imdb_id = str(basic.get("imdb_id") or "")
+        details.update({"tmdb_id": int(tmdb_id), "imdb_id": imdb_id})
+    if needs_imdb:
+        companion = _get_omdb(imdb_id)
+        if companion.get("imdb_rating") is not None:
+            details["imdb_rating"] = companion["imdb_rating"]
+    if needs_kinopoisk:
+        kinopoisk = _get_kinopoisk(
+            imdb_id,
+            str(target.get("title_original") or ""),
+            str(target.get("title_ru") or ""),
+            target.get("year"),
         )
+        details.update(kinopoisk)
+    return details
+
+
+def _needs_movie_refresh(target: dict[str, Any]) -> bool:
+    return (
+        target.get("imdb_rating") in (None, "")
+        or target.get("kinopoisk_rating") in (None, "")
+        or not str(target.get("directors") or "").strip()
+        or not artwork.is_cached(target.get("poster_local_path"))
+    )
+
+
+def _poster_details(target: dict[str, Any]) -> dict[str, Any]:
+    tmdb_id = target.get("tmdb_id")
+    poster_path = str(target.get("poster_path") or "")
+    poster_url = str(target.get("poster_url") or "")
+    if not poster_path and not poster_url:
+        api_key, _ = get_api_key()
+        if not api_key:
+            raise TmdbError("TMDB_API_KEY is not configured")
+        if not str(tmdb_id).isdigit():
+            tmdb_id = resolve_movie(
+                str(target.get("title_original") or ""),
+                str(target.get("title_ru") or ""), target.get("year"), api_key,
+            )
+        basic = _get(f"/movie/{int(tmdb_id)}", {"language": "ru-RU"}, api_key)
+        poster_path = str(basic.get("poster_path") or "")
+        tmdb_id = int(basic.get("id") or tmdb_id)
+        poster_url = artwork.movie_poster_url(poster_path)
+    local_path = ""
+    if poster_path or poster_url:
+        local_path = artwork.cache_movie_poster(tmdb_id, poster_path, poster_url)
+    return {
+        "poster_path": poster_path,
+        "poster_url": poster_url or artwork.movie_poster_url(poster_path),
+        "poster_local_path": local_path,
+    }
+
+
+def _refresh_movie_target(target: dict[str, Any]) -> dict[str, Any]:
+    item_id = str(target["id"])
+    needs_imdb = target.get("imdb_rating") in (None, "")
+    needs_director = not str(target.get("directors") or "").strip()
+    needs_kinopoisk = target.get("kinopoisk_rating") in (None, "")
+    needs_poster = not artwork.is_cached(target.get("poster_local_path"))
+    warnings: list[dict[str, str]] = []
+
+    if needs_imdb or needs_director:
+        api_key, _ = get_api_key()
+        if not api_key:
+            raise TmdbError("TMDB_API_KEY is not configured")
+        tmdb_id = target.get("tmdb_id")
+        if not str(tmdb_id).isdigit():
+            tmdb_id = resolve_movie(
+                str(target.get("title_original") or ""),
+                str(target.get("title_ru") or ""), target.get("year"), api_key,
+            )
+        details = movie_details(int(tmdb_id), api_key, fetch_kinopoisk=needs_kinopoisk)
+        item = storage.update_movie_from_provider(item_id, details)
+        warnings.extend(details.get("provider_warnings", []))
+    else:
+        item = target
+        if needs_kinopoisk:
+            details = _get_kinopoisk(
+                str(target.get("imdb_id") or ""),
+                str(target.get("title_original") or ""),
+                str(target.get("title_ru") or ""), target.get("year"),
+            )
+            item = storage.update_movie_ratings(item_id, details)
+            warnings.extend(details.get("provider_warnings", []))
+        if needs_poster:
+            poster = _poster_details(item)
+            item = storage.update_movie_poster(item_id, poster)
+    if warnings:
+        item["provider_warnings"] = warnings
+    return item
+
+
+def refresh_library() -> dict[str, Any]:
+    targets = [
+        target for target in storage.movie_refresh_targets()
+        if _needs_movie_refresh(target)
+    ]
+
+    def fetch(target: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        return str(target["id"]), _refresh_movie_target(target)
 
     updated: list[str] = []
     errors: list[dict[str, str]] = []
@@ -598,10 +718,9 @@ def refresh_library() -> dict[str, Any]:
         for future in as_completed(futures):
             target = futures[future]
             try:
-                item_id, details = future.result()
-                storage.update_movie_from_provider(item_id, details)
+                item_id, item = future.result()
                 updated.append(item_id)
-                warnings.extend(details.get("provider_warnings", []))
+                warnings.extend(item.get("provider_warnings", []))
             except Exception as error:
                 errors.append({"id": str(target["id"]), "title": str(target["title_original"]), "error": str(error)})
     return {
@@ -611,20 +730,11 @@ def refresh_library() -> dict[str, Any]:
 
 
 def refresh_movie(item_id: str) -> dict[str, Any]:
-    api_key, _ = get_api_key()
-    if not api_key:
-        raise TmdbError("TMDB_API_KEY is not configured")
     target = storage.get_item(item_id)
-    tmdb_id = target.get("tmdb_id")
-    if not str(tmdb_id).isdigit():
-        tmdb_id = resolve_movie(target["title_original"], target["title_ru"], target.get("year"), api_key)
-    details = movie_details(
-        int(tmdb_id), api_key, fetch_kinopoisk=target.get("kinopoisk_rating") in (None, ""),
-    )
-    item = storage.update_movie_from_provider(item_id, details)
-    if details.get("provider_warnings"):
-        item["provider_warnings"] = details["provider_warnings"]
-    return item
+    if not _needs_movie_refresh(target):
+        target["refresh_skipped"] = True
+        return target
+    return _refresh_movie_target(target)
 
 
 def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
@@ -643,6 +753,11 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
     interests = [*actors, *directors]
     if not interests:
         raise TmdbError("Select at least one actor or director")
+    progress_id = filters.get("progress_id")
+    recommendation_progress.start(
+        progress_id, len(interests), stage_id="tmdb-people",
+        label="TMDB · фильмы персон", unit="персон",
+    )
 
     min_imdb_rating = float(filters.get("min_imdb_rating", 0) or 0)
     min_kinopoisk_rating = float(filters.get("min_kinopoisk_rating", 0) or 0)
@@ -657,20 +772,24 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
 
     candidates: dict[int, dict[str, Any]] = {}
     for person in interests:
-        credits = _get(f"/person/{person['external_id']}/movie_credits", {"language": "ru-RU"}, api_key)
-        source_rows = credits.get("cast", []) if person["role"] == "actor" else [
-            row for row in credits.get("crew", []) if row.get("job") == "Director"
-        ]
-        for row in source_rows:
-            movie_id = row.get("id")
-            release_date = str(row.get("release_date") or "")
-            if not movie_id or not (date_from <= release_date <= date_to):
-                continue
-            if excluded_genre_ids & {int(value) for value in row.get("genre_ids", []) if str(value).isdigit()}:
-                continue
-            if int(row.get("vote_count") or 0) < min_votes:
-                continue
-            candidates.setdefault(int(movie_id), row)
+        try:
+            credits = _get(f"/person/{person['external_id']}/movie_credits", {"language": "ru-RU"}, api_key)
+            source_rows = credits.get("cast", []) if person["role"] == "actor" else [
+                row for row in credits.get("crew", []) if row.get("job") == "Director"
+            ]
+            for row in source_rows:
+                movie_id = row.get("id")
+                release_date = str(row.get("release_date") or "")
+                if not movie_id or not (date_from <= release_date <= date_to):
+                    continue
+                if excluded_genre_ids & {int(value) for value in row.get("genre_ids", []) if str(value).isdigit()}:
+                    continue
+                if int(row.get("vote_count") or 0) < min_votes:
+                    continue
+                candidates.setdefault(int(movie_id), row)
+        finally:
+            recommendation_progress.advance(progress_id, "tmdb-people")
+    recommendation_progress.finish_stage(progress_id, "tmdb-people")
 
     known_ids, known_titles = storage.known_movie_keys()
     ranked = sorted(
@@ -678,39 +797,58 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
         key=lambda row: (float(row.get("vote_average") or 0), int(row.get("vote_count") or 0)),
         reverse=True,
     )[: max(limit * 5, 40)]
+    recommendation_progress.set_stage(
+        progress_id, "movie-details", "TMDB / OMDb / Кинопоиск / Images · карточки",
+        len(ranked), "фильмов",
+    )
 
     results: list[dict[str, Any]] = []
-    for row in ranked:
-        movie_id = str(row["id"])
-        year = str(row.get("release_date") or "")[:4]
-        keys = {_normalized(str(row.get("original_title") or "")), _normalized(str(row.get("title") or ""))} - {""}
-        nearby = [year]
-        if year.isdigit():
-            nearby = [str(int(year) - 1), year, str(int(year) + 1)]
-        duplicate = movie_id in known_ids or any(
-            f"{key}:{candidate_year}" in known_titles for key in keys for candidate_year in [*nearby, ""]
-        )
-        if duplicate:
-            continue
-        details = movie_details(int(movie_id), api_key)
-        if int(details.get("duration_minutes") or 0) < min_runtime:
-            continue
-        if min_imdb_rating and float(details.get("imdb_rating") or 0) < min_imdb_rating:
-            continue
-        if min_kinopoisk_rating:
-            rating = details.get("kinopoisk_rating")
-            kinopoisk_failed = any(
-                warning.get("provider") == "kinopoisk"
-                for warning in details.get("provider_warnings", [])
-                if isinstance(warning, dict)
-            )
-            if rating in (None, "") and not kinopoisk_failed:
-                continue
-            if rating not in (None, "") and float(rating) < min_kinopoisk_rating:
-                continue
-        if excluded_genres & {_normalized(genre) for genre in details.get("genres", "").split(";")}:
-            continue
-        results.append(details)
-        if len(results) >= limit:
-            break
+    try:
+        for row in ranked:
+            try:
+                movie_id = str(row["id"])
+                year = str(row.get("release_date") or "")[:4]
+                keys = {_normalized(str(row.get("original_title") or "")), _normalized(str(row.get("title") or ""))} - {""}
+                nearby = [year]
+                if year.isdigit():
+                    nearby = [str(int(year) - 1), year, str(int(year) + 1)]
+                duplicate = movie_id in known_ids or any(
+                    f"{key}:{candidate_year}" in known_titles for key in keys for candidate_year in [*nearby, ""]
+                )
+                if duplicate:
+                    continue
+                details = movie_details(int(movie_id), api_key)
+                for warning in details.get("provider_warnings", []):
+                    if isinstance(warning, dict) and warning.get("message"):
+                        recommendation_progress.add_warning(
+                            progress_id, str(warning.get("provider") or "API"), str(warning["message"])
+                        )
+                if int(details.get("duration_minutes") or 0) < min_runtime:
+                    continue
+                if min_imdb_rating and float(details.get("imdb_rating") or 0) < min_imdb_rating:
+                    continue
+                if min_kinopoisk_rating:
+                    rating = details.get("kinopoisk_rating")
+                    kinopoisk_failed = any(
+                        warning.get("provider") == "kinopoisk"
+                        for warning in details.get("provider_warnings", [])
+                        if isinstance(warning, dict)
+                    )
+                    if rating in (None, "") and not kinopoisk_failed:
+                        continue
+                    if rating not in (None, "") and float(rating) < min_kinopoisk_rating:
+                        continue
+                if excluded_genres & {_normalized(genre) for genre in details.get("genres", "").split(";")}:
+                    continue
+                results.append(details)
+                if len(results) >= limit:
+                    break
+            except Exception as error:
+                recommendation_progress.add_warning(progress_id, "TMDB", str(error))
+                raise
+            finally:
+                recommendation_progress.advance(progress_id, "movie-details")
+    finally:
+        recommendation_progress.finish_stage(progress_id, "movie-details")
+        recommendation_progress.finish(progress_id)
     return results

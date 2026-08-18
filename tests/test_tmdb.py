@@ -168,18 +168,83 @@ class TmdbTests(unittest.TestCase):
         save.assert_called_once_with("person-two", details)
         self.assertEqual(result["id"], "person-two")
 
-    def test_refresh_movie_skips_kinopoisk_when_rating_is_already_stored(self) -> None:
+    def test_refresh_movie_runs_full_tmdb_update_when_imdb_rating_is_missing(self) -> None:
         target = {
             "id":"movie-one", "title_original":"The Matrix", "title_ru":"Матрица",
-            "year":1999, "tmdb_id":603, "kinopoisk_rating":8.5,
+            "year":1999, "tmdb_id":603, "imdb_id":"tt0133093",
+            "imdb_rating":"", "kinopoisk_rating":8.5, "directors":"Lana Wachowski",
+            "poster_local_path":"movies/603.jpg",
         }
-        details = {"tmdb_id":603,"title_original":"The Matrix","title_ru":"Матрица"}
-        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
-             patch.object(tmdb.storage,"get_item",return_value=target), \
+        details = {**target, "imdb_rating":8.7}
+        with patch.object(tmdb.storage,"get_item",return_value=target), \
+             patch.object(tmdb,"get_api_key",return_value=("key","test")), \
              patch.object(tmdb,"movie_details",return_value=details) as fetch, \
-             patch.object(tmdb.storage,"update_movie_from_provider",return_value=target):
+             patch.object(tmdb,"_get_kinopoisk") as kinopoisk, \
+             patch.object(tmdb.storage,"update_movie_from_provider",return_value=details) as save:
             tmdb.refresh_movie("movie-one")
         fetch.assert_called_once_with(603, "key", fetch_kinopoisk=False)
+        kinopoisk.assert_not_called()
+        save.assert_called_once_with("movie-one", details)
+
+    def test_refresh_movie_calls_only_kinopoisk_when_only_its_rating_is_missing(self) -> None:
+        target = {
+            "id":"movie-one", "title_original":"The Matrix", "title_ru":"Матрица",
+            "year":1999, "tmdb_id":603, "imdb_id":"tt0133093",
+            "imdb_rating":8.7, "kinopoisk_rating":"", "directors":"Lana Wachowski",
+            "poster_local_path":"movies/603.jpg",
+        }
+        kp = {"kinopoisk_id":301, "kinopoisk_rating":8.5}
+        with patch.object(tmdb.storage,"get_item",return_value=target), \
+             patch.object(tmdb.artwork,"is_cached",return_value=True), \
+             patch.object(tmdb,"_get_omdb") as imdb, \
+             patch.object(tmdb,"_get_kinopoisk",return_value=kp) as kinopoisk, \
+             patch.object(tmdb.storage,"update_movie_ratings",return_value={**target,**kp}) as save:
+            tmdb.refresh_movie("movie-one")
+        imdb.assert_not_called()
+        kinopoisk.assert_called_once_with("tt0133093", "The Matrix", "Матрица", 1999)
+        save.assert_called_once_with("movie-one", kp)
+
+    def test_refresh_movie_skips_all_providers_when_both_ratings_exist(self) -> None:
+        target = {"id":"movie-one", "imdb_rating":8.7, "kinopoisk_rating":8.5, "directors":"Director", "poster_local_path":"movies/1.jpg"}
+        with patch.object(tmdb.storage,"get_item",return_value=target), \
+             patch.object(tmdb.artwork,"is_cached",return_value=True), \
+             patch.object(tmdb,"_refresh_movie_target") as fetch:
+            result = tmdb.refresh_movie("movie-one")
+        fetch.assert_not_called()
+        self.assertEqual(result, target)
+
+    def test_refresh_movie_downloads_only_poster_when_only_local_file_is_missing(self) -> None:
+        target = {
+            "id":"movie-one", "tmdb_id":603, "imdb_rating":8.7,
+            "kinopoisk_rating":8.5, "directors":"Director", "poster_path":"/poster.jpg",
+            "poster_url":"https://image.tmdb.org/t/p/w500/poster.jpg", "poster_local_path":"",
+        }
+        poster = {"poster_path":"/poster.jpg", "poster_url":target["poster_url"], "poster_local_path":"movies/603.jpg"}
+        with patch.object(tmdb.storage,"get_item",return_value=target), \
+             patch.object(tmdb.artwork,"is_cached",return_value=False), \
+             patch.object(tmdb,"_poster_details",return_value=poster) as fetch, \
+             patch.object(tmdb,"movie_details") as full, \
+             patch.object(tmdb,"_get_kinopoisk") as kinopoisk, \
+             patch.object(tmdb.storage,"update_movie_poster",return_value={**target,**poster}) as save:
+            tmdb.refresh_movie("movie-one")
+        fetch.assert_called_once_with(target)
+        full.assert_not_called()
+        kinopoisk.assert_not_called()
+        save.assert_called_once_with("movie-one", poster)
+
+    def test_bulk_rating_refresh_queues_only_movies_with_missing_rating(self) -> None:
+        targets = [
+            {"id":"complete", "title_original":"Complete", "imdb_rating":8, "kinopoisk_rating":7, "directors":"D", "poster_local_path":"movies/1.jpg"},
+            {"id":"missing-imdb", "title_original":"One", "imdb_rating":"", "kinopoisk_rating":7, "directors":"D", "poster_local_path":"movies/2.jpg"},
+            {"id":"missing-kp", "title_original":"Two", "imdb_rating":8, "kinopoisk_rating":"", "directors":"D", "poster_local_path":"movies/3.jpg"},
+        ]
+        with patch.object(tmdb.storage, "movie_refresh_targets", return_value=targets), \
+             patch.object(tmdb.artwork, "is_cached", return_value=True), \
+             patch.object(tmdb, "_refresh_movie_target", side_effect=lambda item: item) as fetch:
+            result = tmdb.refresh_library()
+        self.assertEqual({call.args[0]["id"] for call in fetch.call_args_list}, {"missing-imdb", "missing-kp"})
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["updated"], 2)
 
     def test_api_recommendations_apply_year_and_translated_genres_before_enrichment(self) -> None:
         credits = {"cast":[

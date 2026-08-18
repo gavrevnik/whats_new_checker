@@ -9,12 +9,13 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from app import storage, tmdb
+from app import listenbrainz, musicbrainz, storage, tmdb
 from app.storage import ROOT
 
 
 RUNNER = ROOT / "scripts" / "run_codex_recommendation.py"
 SCHEMA_PATH = ROOT / "app" / "movie_recommendations.schema.json"
+ALBUM_SCHEMA_PATH = ROOT / "app" / "album_recommendations.schema.json"
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 DEFAULT_MODEL = "gpt-5.6-terra"
 
@@ -33,7 +34,7 @@ def get_model() -> str:
 
 def configuration() -> dict[str, Any]:
     return {
-        "configured": VENV_PYTHON.exists() and RUNNER.exists() and SCHEMA_PATH.exists(),
+        "configured": VENV_PYTHON.exists() and RUNNER.exists() and SCHEMA_PATH.exists() and ALBUM_SCHEMA_PATH.exists(),
         "provider": "Codex SDK",
         "model": get_model(),
         "auth": "ChatGPT/Codex local login",
@@ -311,3 +312,167 @@ def recommend_movies(payload: dict[str, Any]) -> dict[str, Any]:
     requested = int(limit_raw) if limit_raw is not None else 10
     items, errors = _enrich_movies(candidates[:requested], payload)
     return {"items": items, "errors": errors, "model": model, "requested": requested, "received": len(candidates)}
+
+
+def _album_line(item: dict[str, Any]) -> str:
+    title = str(item.get("title_ru") or item.get("title_original") or "Без названия")
+    original = str(item.get("title_original") or "")
+    if original and original.casefold() != title.casefold():
+        title += f" ({original})"
+    details = [str(item.get("artists") or ""), str(item.get("year") or "")]
+    suffix = ", ".join(value for value in details if value)
+    return f"- {title}{f' — {suffix}' if suffix else ''}"
+
+
+def _artist_line(person: dict[str, Any]) -> str:
+    name = str(person.get("name_original") or person.get("name_ru") or "")
+    return f"- {name} — исполнитель"
+
+
+def build_album_prompt(payload: dict[str, Any]) -> str:
+    current_year = date.today().year
+    year_from_raw = _optional_number(payload, "year_from", 2023, 1900, current_year + 2)
+    year_to_raw = _optional_number(payload, "year_to", current_year, 1900, current_year + 2)
+    year_from = int(year_from_raw) if year_from_raw is not None else None
+    year_to = int(year_to_raw) if year_to_raw is not None else None
+    if year_from is not None and year_to is not None and year_from > year_to:
+        raise LlmError("Начальный год не может быть больше конечного")
+    liked_sample_size = int(_number(payload, "liked_sample_size", 30, 0, 200))
+    limit_raw = _optional_number(payload, "limit", 5, 1, 20)
+    limit = int(limit_raw) if limit_raw is not None else 10
+    user_prompt = str(payload.get("prompt") or "").strip()
+    if len(user_prompt) > 8000:
+        raise LlmError("Пользовательский промпт слишком длинный")
+    albums = storage.list_library(content_type="music")
+    liked_albums = [
+        item for item in albums
+        if item.get("status") == "consumed" and item.get("reaction") == "like"
+    ]
+    liked = [
+        _album_line(item)
+        for item in random.sample(liked_albums, min(liked_sample_size, len(liked_albums)))
+    ]
+    backlog = [_album_line(item) for item in albums if item.get("status") == "backlog"]
+    artists = [_artist_line(item) for item in storage.list_music_artists()]
+    filters = []
+    if year_from is not None and year_to is not None:
+        filters.append(f"- первый выпуск альбома с {year_from} по {year_to} год включительно")
+    elif year_from is not None:
+        filters.append(f"- первый выпуск альбома не раньше {year_from} года")
+    elif year_to is not None:
+        filters.append(f"- первый выпуск альбома не позже {year_to} года")
+    filters.append(f"- верни не более {limit} альбомов")
+    user_block = user_prompt or "Дополнительных пожеланий нет — подбери альбомы по профилю вкусов."
+    return "\n\n".join([
+        "Задача: порекомендуй музыкальные альбомы, соблюдая все условия ниже. Не включай синглы и EP, "
+        "альбомы из бэклога или уже прослушанные альбомы. Для каждой позиции дай короткий содержательный "
+        "комментарий на русском, почему она подходит этому пользователю.",
+        _section("Обязательные фильтры", filters),
+        f"Свободный запрос пользователя:\n{user_block}",
+        _section("Альбомы, которые понравились пользователю", liked),
+        _section("Любимые исполнители (мягкий сигнал; рекомендации не обязаны ограничиваться ими)", artists),
+        _section("Текущий бэклог — эти альбомы нельзя повторять", backlog),
+        "Формат задаётся JSON Schema. Верни только JSON-объект с массивом albums. Для каждого альбома "
+        "обязательны title (каноническое название), artist (основной исполнитель), year (целое число) и "
+        "comment (комментарий на русском). Не добавляй Markdown или вступление.",
+    ])
+
+
+def _parse_album_response(raw: str) -> list[dict[str, Any]]:
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise LlmError(f"Codex вернул ответ, который не удалось разобрать как JSON: {error}") from error
+    albums = response.get("albums") if isinstance(response, dict) else None
+    if not isinstance(albums, list):
+        raise LlmError("Codex вернул JSON без массива albums")
+    parsed: list[dict[str, Any]] = []
+    for index, album in enumerate(albums, start=1):
+        if not isinstance(album, dict):
+            raise LlmError(f"Позиция {index} в ответе Codex имеет неверный формат")
+        title = str(album.get("title") or "").strip()
+        artist = str(album.get("artist") or "").strip()
+        comment = str(album.get("comment") or "").strip()
+        try:
+            year = int(album.get("year"))
+        except (TypeError, ValueError) as error:
+            raise LlmError(f"У позиции {index} отсутствует корректный год") from error
+        if not title or not artist or not comment or not 1900 <= year <= 2100:
+            raise LlmError(f"У позиции {index} не заполнены обязательные поля")
+        parsed.append({"title": title, "artist": artist, "year": year, "comment": comment})
+    return parsed
+
+
+def recommend_albums(payload: dict[str, Any]) -> dict[str, Any]:
+    prompt = build_album_prompt(payload)
+    if not VENV_PYTHON.exists():
+        raise LlmError(
+            "Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+        )
+    model = get_model()
+    try:
+        completed = subprocess.run(
+            [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(ALBUM_SCHEMA_PATH)],
+            input=prompt, text=True, capture_output=True, cwd=ROOT, timeout=300, check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise LlmError("Codex не успел ответить за 5 минут") from error
+    except OSError as error:
+        raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
+        raise LlmError(f"Codex SDK: {message[-1200:]}")
+    candidates = _parse_album_response(completed.stdout.strip())
+    limit_raw = _optional_number(payload, "limit", 5, 1, 20)
+    requested = int(limit_raw) if limit_raw is not None else 10
+    known_ids, known_titles = storage.known_album_keys()
+    items: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates[:requested]:
+        label = f"{candidate['artist']} — {candidate['title']} ({candidate['year']})"
+        normalized = storage._normalized(candidate["title"])
+        if normalized in known_titles:
+            errors.append({"title": label, "error": "уже есть в библиотеке или корзине"})
+            continue
+        try:
+            found = musicbrainz.search_album(candidate["title"], candidate["artist"], candidate["year"])
+            mbid = str(found.get("release_group_mbid") or "")
+            if not mbid or mbid in known_ids or mbid in seen:
+                errors.append({"title": label, "error": "уже есть в библиотеке или корзине"})
+                continue
+            details = musicbrainz.album_details(mbid, fetch_popularity=False)
+            year_from = _optional_number(payload, "year_from", 2023, 1900, date.today().year + 2)
+            year_to = _optional_number(payload, "year_to", date.today().year, 1900, date.today().year + 2)
+            actual_year = details.get("year")
+            if actual_year is None or (year_from is not None and int(actual_year) < int(year_from)) or (
+                year_to is not None and int(actual_year) > int(year_to)
+            ):
+                errors.append({"title": label, "error": "год альбома не соответствует фильтру"})
+                continue
+            details.update({
+                "notes": candidate["comment"],
+                "llm_comment": candidate["comment"],
+                "raw_data": candidate,
+            })
+            seen.add(mbid)
+            items.append(details)
+        except Exception as error:
+            errors.append({"title": label, "error": str(error)})
+    warnings = []
+    if items:
+        try:
+            listenbrainz.enrich_albums(items)
+        except listenbrainz.ListenBrainzError as error:
+            warnings.append({"provider": "listenbrainz", "message": str(error)})
+    if errors:
+        warnings.append({
+            "provider": "musicbrainz",
+            "message": f"Не удалось уточнить {len(errors)} рекомендаций через MusicBrainz.",
+        })
+    for item in items:
+        item["provider_warnings"] = item.get("provider_warnings", []) + warnings
+    return {
+        "items": items, "errors": errors, "model": model,
+        "requested": requested, "received": len(candidates), "provider_warnings": warnings,
+    }

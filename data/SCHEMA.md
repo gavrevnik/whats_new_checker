@@ -1,12 +1,12 @@
 # SQLite schema
 
-The active datastore is `data/library.sqlite3`. The application initializes missing tables from `app/storage.py`; legacy CSV snapshots are preserved in `legacy/csv/` and are not read at runtime.
+The active datastore is `data/library.sqlite3`. The application initializes missing tables from `app/storage.py`; legacy CSV snapshots are preserved in `legacy/csv/` and are not read at runtime. Movies and music share workflow fields in `content_items`, while provider-specific data remains in separate tables.
 
 ## Core tables
 
-- `content_types`: extensibility point for future content. Only `movie` is enabled.
+- `content_types`: enabled `movie` and `music` content types.
 - `content_items`: bilingual titles, workflow status (`backlog`, `consumed`, `dismissed`), reaction (``, `like`, `dislike`), provenance, notes, original user input in `raw_json`, and timestamps.
-- `movies`: release date/year, runtime, separate IMDb, Kinopoisk, and TMDB ratings, vote counts, IMDb/Kinopoisk/TMDB IDs, overview, language, awards, tagline, certification, Metascore, box office, extended details JSON, and last TMDB refresh time.
+- `movies`: release date/year, runtime, separate IMDb, Kinopoisk, and TMDB ratings, vote counts, IMDb/Kinopoisk/TMDB IDs, overview, language, awards, tagline, certification, Metascore, box office, TMDB `poster_path`/`poster_url`, local `poster_local_path`, extended details JSON, and last TMDB refresh time.
 - `people`: canonical bilingual names, TMDB IDs, original user input in `raw_json`, extended TMDB details JSON, and last refresh time.
 - `interest_roles`: active actors/directors used for recommendations.
 - `movie_people`: directors and matched interest people for each movie.
@@ -14,6 +14,9 @@ The active datastore is `data/library.sqlite3`. The application initializes miss
 - `content_aliases`: aliases and external mappings used for deduplication.
 - `trash_entries`: reversible soft-delete markers for a movie or a person role, plus a compact display snapshot. Active queries exclude marked entities; their normalized data and relationships remain intact.
 - `favorite_movies`: independent movie-to-favorite marker and addition timestamp. Adding or removing it does not change movie status, reaction, notes, or recommendation history.
+- `albums`: MusicBrainz release groups with first release date, selected release, track count, types, genres/tags, label, country, barcode, media formats, Cover Art Archive `cover_url`, local `cover_path`, ListenBrainz `total_listen_count`, extended details, and provider refresh timestamps. MusicBrainz rating fields are intentionally absent.
+- `music_artists`: active recommendation artists and inactive artists discovered through album credits, with MusicBrainz MBID and canonical metadata.
+- `album_artists`: ordered album credits and markers for artists in the active interest list.
 
 `awards_json` is a JSON array. A summary-only provider uses:
 
@@ -31,4 +34,6 @@ TMDB does not expose structured awards. TMDB refresh therefore preserves existin
 
 `kinopoisk_id` and `kinopoisk_rating` are filled by Kinopoisk API Unofficial during TMDB enrichment. The provider lookup uses the movie title and a ±1 year window because its IMDb mapping and canonical year may be absent or differ from TMDB; IMDb ID is used as an additional exact match when present in the response. A saved non-empty rating is treated as cached and is not requested again. The public Kinopoisk URL is derived as `https://www.kinopoisk.ru/film/{kinopoisk_id}/`.
 
-`movies.details_json` stores optional provider fields that should not expand the main table: cast, writers, countries, production companies, spoken languages, keywords, budget, revenue, homepage, poster URL, and provider status. The HTTP API flattens these fields for the movie detail card.
+`movies.details_json` stores optional provider fields that should not expand the main table: cast, writers, countries, production companies, spoken languages, keywords, budget, revenue, homepage, and provider status. Poster metadata is stored in dedicated columns. The HTTP API flattens optional fields for the movie detail card.
+
+`albums.details_json` stores the selected release status/title, annotation, and track list. An album is modeled as a MusicBrainz `release-group`; `primary_release_mbid` points to the selected official `release` used for edition-specific fields such as track count, label, country, barcode, and media format. `cover_url` stores the 500 px Cover Art Archive release-group URL, while `cover_path` points to an ignored local JPEG under `data/artwork/`; image bytes are never stored in SQLite. Movies use the same pattern with `poster_url` and `poster_local_path`. An empty URL is a valid cached result when no front image exists, and `cover_art_updated_at` records the last successful availability check. `total_listen_count` is the all-time ListenBrainz popularity count for the release group; `listenbrainz_updated_at` records a successful batch lookup even when the provider returned `null`.

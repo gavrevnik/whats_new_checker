@@ -17,12 +17,12 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import llm, storage, tmdb
+from app import artwork, listenbrainz, llm, musicbrainz, recommendation_progress, storage, tmdb
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PID_FILE = Path(__file__).resolve().parents[1] / ".runtime" / "server.pid"
-APP_VERSION = 18
+APP_VERSION = 27
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -74,18 +74,84 @@ class Handler(BaseHTTPRequestHandler):
                     "interests": storage.list_interests(),
                     "content_types": storage.list_content_types(),
                     "tmdb": tmdb.configuration(),
+                    "musicbrainz": musicbrainz.configuration(),
+                    "listenbrainz": listenbrainz.configuration(),
                     "llm": llm.configuration(),
                 }
             )
             return
         if parsed.path == "/api/people":
             query = parse_qs(parsed.query)
-            self._json({"items": storage.list_interests("movie", query.get("role", [None])[0])})
+            self._json({
+                "items": storage.list_interests(
+                    query.get("content_type", ["movie"])[0], query.get("role", [None])[0]
+                )
+            })
             return
         if parsed.path == "/api/trash":
             self._json({"items": storage.list_trash()})
             return
+        if parsed.path == "/api/recommendations/progress":
+            query = parse_qs(parsed.query)
+            self._json(recommendation_progress.get(query.get("id", [""])[0]))
+            return
+        if parsed.path.startswith("/api/artwork/"):
+            self._serve_item_artwork(parsed.path)
+            return
+        if parsed.path.startswith("/media/artwork/"):
+            self._serve_artwork_file(unquote(parsed.path[len("/media/artwork/"):]))
+            return
         self._serve_static(parsed.path)
+
+    def _serve_item_artwork(self, url_path: str) -> None:
+        parts = [unquote(part) for part in url_path.split("/") if part]
+        if len(parts) != 4 or parts[:2] != ["api", "artwork"] or parts[2] not in {"movie", "music"}:
+            self._error("Not found", HTTPStatus.NOT_FOUND)
+            return
+        content_type, item_id = parts[2], parts[3]
+        try:
+            item = storage.get_item(item_id)
+            if item.get("content_type") != content_type:
+                raise storage.StorageError("Item not found")
+            if content_type == "music":
+                relative = str(item.get("cover_path") or "")
+                if not artwork.is_cached(relative):
+                    relative = artwork.cache_album_cover(
+                        str(item.get("release_group_mbid") or ""), str(item.get("cover_url") or "")
+                    )
+            else:
+                relative = str(item.get("poster_local_path") or "")
+                if not artwork.is_cached(relative):
+                    relative = artwork.cache_movie_poster(
+                        item.get("tmdb_id"), str(item.get("poster_path") or ""),
+                        str(item.get("poster_url") or ""),
+                    )
+            if not relative:
+                self._error("Изображение отсутствует", HTTPStatus.NOT_FOUND)
+                return
+            stored_path = item.get("cover_path") if content_type == "music" else item.get("poster_local_path")
+            if relative != stored_path:
+                storage.update_artwork_path(item_id, content_type, relative)
+            self._serve_artwork_file(relative)
+        except (storage.StorageError, artwork.ArtworkError) as error:
+            self._error(str(error), HTTPStatus.NOT_FOUND)
+
+    def _serve_artwork_file(self, relative_path: str) -> None:
+        try:
+            candidate = artwork.resolve_local_path(relative_path)
+        except artwork.ArtworkError:
+            self._error("Not found", HTTPStatus.NOT_FOUND)
+            return
+        if not candidate.is_file():
+            self._error("Not found", HTTPStatus.NOT_FOUND)
+            return
+        body = candidate.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", artwork.content_type(relative_path))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -95,10 +161,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"item": tmdb.resolve_movie_input(payload)})
                 return
             if parsed.path == "/api/resolve/person":
-                self._json({"item": tmdb.resolve_person_input(payload)})
+                resolver = musicbrainz.resolve_artist_input if payload.get("content_type") == "music" else tmdb.resolve_person_input
+                self._json({"item": resolver(payload)})
+                return
+            if parsed.path == "/api/resolve/album":
+                self._json({"item": musicbrainz.resolve_album_input(payload)})
                 return
             if parsed.path == "/api/trash":
                 self._json({"item": storage.trash_entity(payload)}, HTTPStatus.CREATED)
+                return
+            if parsed.path == "/api/trash/empty":
+                self._json(storage.empty_trash())
                 return
             if parsed.path.startswith("/api/trash/") and parsed.path.endswith("/restore"):
                 trash_id = unquote(parsed.path[len("/api/trash/"):-len("/restore")]).strip("/")
@@ -111,6 +184,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/library/refresh-tmdb":
                 self._json(tmdb.refresh_library())
+                return
+            if parsed.path == "/api/library/refresh-musicbrainz":
+                self._json(musicbrainz.refresh_library())
                 return
             if parsed.path.startswith("/api/library/") and parsed.path.endswith("/favorite"):
                 item_id = unquote(parsed.path[len("/api/library/"):-len("/favorite")]).strip("/")
@@ -127,11 +203,20 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Movie ID is required")
                 self._json({"item": tmdb.refresh_movie(item_id)})
                 return
+            if parsed.path.startswith("/api/library/") and parsed.path.endswith("/refresh-musicbrainz"):
+                item_id = unquote(parsed.path[len("/api/library/"):-len("/refresh-musicbrainz")]).strip("/")
+                if not item_id:
+                    raise ValueError("Album ID is required")
+                self._json({"item": musicbrainz.refresh_album(item_id)})
+                return
             if parsed.path == "/api/people":
                 self._json({"item": storage.add_interest_person(payload)}, HTTPStatus.CREATED)
                 return
             if parsed.path == "/api/people/refresh-tmdb":
                 self._json(tmdb.refresh_people())
+                return
+            if parsed.path == "/api/people/refresh-musicbrainz":
+                self._json(musicbrainz.refresh_artists())
                 return
             if parsed.path.startswith("/api/people/") and parsed.path.endswith("/refresh-tmdb"):
                 person_id = unquote(parsed.path[len("/api/people/"):-len("/refresh-tmdb")]).strip("/")
@@ -139,14 +224,30 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Person ID is required")
                 self._json({"item": tmdb.refresh_person(person_id)})
                 return
+            if parsed.path.startswith("/api/people/") and parsed.path.endswith("/refresh-musicbrainz"):
+                person_id = unquote(parsed.path[len("/api/people/"):-len("/refresh-musicbrainz")]).strip("/")
+                if not person_id:
+                    raise ValueError("Artist ID is required")
+                self._json({"item": musicbrainz.refresh_artist(person_id)})
+                return
             if parsed.path == "/api/recommendations/tmdb":
                 self._json({"items": tmdb.recommend_movies(payload)})
                 return
             if parsed.path == "/api/recommendations/llm":
-                self._json(llm.recommend_movies(payload))
+                self._json(
+                    llm.recommend_albums(payload)
+                    if payload.get("content_type") == "music"
+                    else llm.recommend_movies(payload)
+                )
+                return
+            if parsed.path == "/api/recommendations/musicbrainz":
+                self._json(musicbrainz.recommend_albums(payload))
                 return
             self._error("Endpoint not found", HTTPStatus.NOT_FOUND)
-        except (ValueError, storage.StorageError, tmdb.TmdbError, llm.LlmError) as error:
+        except (
+            ValueError, storage.StorageError, tmdb.TmdbError, musicbrainz.MusicBrainzError,
+            listenbrainz.ListenBrainzError, llm.LlmError,
+        ) as error:
             self._error(str(error))
         except Exception as error:
             self._error(f"Internal error: {error}", HTTPStatus.INTERNAL_SERVER_ERROR)
