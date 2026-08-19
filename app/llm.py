@@ -9,15 +9,22 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from app import listenbrainz, musicbrainz, storage, tmdb
+from app import listenbrainz, musicbrainz, recommendation_progress, storage, tmdb
 from app.storage import ROOT
 
 
 RUNNER = ROOT / "scripts" / "run_codex_recommendation.py"
 SCHEMA_PATH = ROOT / "app" / "movie_recommendations.schema.json"
 ALBUM_SCHEMA_PATH = ROOT / "app" / "album_recommendations.schema.json"
+PERSON_SCHEMA_PATH = ROOT / "app" / "person_recommendations.schema.json"
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 DEFAULT_MODEL = "gpt-5.6-terra"
+BASE_INSTRUCTIONS = """You are a personal movie and music recommendation assistant.
+Follow the supplied Russian-language task exactly. Do not inspect files, execute shell commands,
+modify anything, or ask follow-up questions. Use only the context included in the prompt and your
+knowledge. Return only JSON that strictly matches the supplied output schema. Do not wrap it in
+Markdown, add prose outside the JSON, or change the field names.
+"""
 
 
 class LlmError(RuntimeError):
@@ -34,7 +41,9 @@ def get_model() -> str:
 
 def configuration() -> dict[str, Any]:
     return {
-        "configured": VENV_PYTHON.exists() and RUNNER.exists() and SCHEMA_PATH.exists() and ALBUM_SCHEMA_PATH.exists(),
+        "configured": all(path.exists() for path in (
+            VENV_PYTHON, RUNNER, SCHEMA_PATH, ALBUM_SCHEMA_PATH, PERSON_SCHEMA_PATH,
+        )),
         "provider": "Codex SDK",
         "model": get_model(),
         "auth": "ChatGPT/Codex local login",
@@ -85,6 +94,14 @@ def _section(title: str, lines: list[str]) -> str:
     return f"{title}:\n" + ("\n".join(lines) if lines else "- нет данных")
 
 
+def _sample_context(items: list[dict[str, Any]], count: int, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    sample_size = min(count, len(items))
+    seed = str(payload.get("context_seed") or "").strip()
+    if seed:
+        return random.Random(seed).sample(items, sample_size)
+    return random.sample(items, sample_size)
+
+
 def build_movie_prompt(payload: dict[str, Any]) -> str:
     current_year = date.today().year
     imdb_rating = _optional_number(payload, "min_imdb_rating", 7, 0, 10)
@@ -106,11 +123,9 @@ def build_movie_prompt(payload: dict[str, Any]) -> str:
 
     movies = storage.list_library(content_type="movie")
     liked_movies = [item for item in movies if item.get("status") == "consumed" and item.get("reaction") == "like"]
-    liked = [
-        _movie_line(item)
-        for item in random.sample(liked_movies, min(liked_sample_size, len(liked_movies)))
-    ]
-    backlog = [_movie_line(item) for item in movies if item.get("status") == "backlog"]
+    liked = [_movie_line(item) for item in _sample_context(liked_movies, liked_sample_size, payload)]
+    existing_movies = storage.list_library(content_type="movie", include_trashed=True)
+    exclusions = [_movie_line(item) for item in existing_movies]
     people = [_person_line(person) for person in storage.list_interests("movie")]
     user_block = user_prompt or "Дополнительных пожеланий нет — подбери наиболее релевантные фильмы по профилю вкусов."
 
@@ -149,7 +164,10 @@ def build_movie_prompt(payload: dict[str, Any]) -> str:
             "Любимые актёры и режиссёры (используй как мягкий сигнал вкуса; их участие не обязательно, если пользователь прямо этого не потребовал)",
             people,
         ),
-        _section("Текущий бэклог — эти фильмы нельзя повторять", backlog),
+        _section(
+            "Уже добавленные фильмы, включая бэклог, просмотренное и корзину — не рекомендовать их повторно",
+            exclusions,
+        ),
         "Формат ответа задаётся JSON Schema. Верни только JSON-объект с массивом movies. У каждого фильма обязательны "
         "поля title_ru (официальное или наиболее употребимое русское название), title_original (оригинальное название), "
         "year (целое число) и comment (комментарий на русском). Не добавляй вступление, Markdown, вопросы пользователю "
@@ -237,12 +255,41 @@ def _passes_filters(item: dict[str, Any], payload: dict[str, Any]) -> str:
     return ""
 
 
-def _enrich_movies(candidates: list[dict[str, Any]], payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def _movie_candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "content_type": "movie",
+        "title_ru": str(candidate.get("title_ru") or candidate.get("title_original") or "Без названия"),
+        "title_original": str(candidate.get("title_original") or candidate.get("title_ru") or "Без названия"),
+        "year": candidate.get("year"),
+        "notes": str(candidate.get("comment") or candidate.get("notes") or ""),
+        "source": "llm",
+        "raw_data": candidate,
+    }
+
+
+def _album_candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    title = str(candidate.get("title") or candidate.get("title_original") or "Без названия")
+    return {
+        "content_type": "music",
+        "title_ru": title,
+        "title_original": title,
+        "artists": str(candidate.get("artist") or candidate.get("artists") or "Неизвестный исполнитель"),
+        "year": candidate.get("year"),
+        "notes": str(candidate.get("comment") or candidate.get("notes") or ""),
+        "source": "llm",
+        "raw_data": candidate,
+    }
+
+
+def _enrich_movies(
+    candidates: list[dict[str, Any]], payload: dict[str, Any], progress_id: object = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]]:
     api_key, _ = tmdb.get_api_key()
     if not api_key:
         raise LlmError("TMDB_API_KEY не настроен: невозможно уточнить рекомендации")
     known_ids, known_titles = storage.known_movie_keys()
     errors: list[dict[str, str]] = []
+    filtered_items: list[dict[str, Any]] = []
     results: list[tuple[int, dict[str, Any]]] = []
 
     eligible: list[tuple[int, dict[str, Any]]] = []
@@ -250,6 +297,7 @@ def _enrich_movies(candidates: list[dict[str, Any]], payload: dict[str, Any]) ->
         label = f"{candidate['title_ru']} ({candidate['title_original']}, {candidate['year']})"
         if _known_title(candidate, known_titles):
             errors.append({"title": label, "error": "уже есть в библиотеке или корзине"})
+            recommendation_progress.advance(progress_id, "llm-movie-details")
         else:
             eligible.append((index, candidate))
 
@@ -260,58 +308,82 @@ def _enrich_movies(candidates: list[dict[str, Any]], payload: dict[str, Any]) ->
             label = f"{candidate['title_ru']} ({candidate['title_original']}, {candidate['year']})"
             try:
                 item = future.result()
-                reason = _passes_filters(item, payload)
-                if reason:
-                    errors.append({"title": label, "error": reason})
-                    continue
                 if str(item.get("tmdb_id") or "") in known_ids or _known_title(item, known_titles):
                     errors.append({"title": label, "error": "уже есть в библиотеке или корзине"})
                     continue
+                reason = _passes_filters(item, payload)
+                if reason:
+                    errors.append({"title": label, "error": reason})
+                    filtered_items.append({"item": item, "reason": reason})
+                    continue
                 results.append((index, item))
             except Exception as error:
-                errors.append({"title": label, "error": str(error)})
+                reason = str(error)
+                errors.append({"title": label, "error": reason})
+                filtered_items.append({"item": _movie_candidate_payload(candidate), "reason": reason})
+            finally:
+                recommendation_progress.advance(progress_id, "llm-movie-details")
 
     items: list[dict[str, Any]] = []
     seen_tmdb_ids: set[str] = set()
     for _, item in sorted(results, key=lambda row: row[0]):
         tmdb_id = str(item.get("tmdb_id") or "")
-        if tmdb_id in seen_tmdb_ids:
+        if tmdb_id and tmdb_id in seen_tmdb_ids:
+            filtered_items.append({"item": item, "reason": "дубликат в текущей выдаче"})
             continue
-        seen_tmdb_ids.add(tmdb_id)
+        if tmdb_id:
+            seen_tmdb_ids.add(tmdb_id)
         items.append(item)
-    return items, errors
+    return items, filtered_items, errors
 
 
 def recommend_movies(payload: dict[str, Any]) -> dict[str, Any]:
-    prompt = build_movie_prompt(payload)
-    if not VENV_PYTHON.exists():
-        raise LlmError("Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt")
-    model = get_model()
+    progress_id = payload.get("progress_id")
+    recommendation_progress.start(
+        progress_id, 1, stage_id="llm-request", label="Codex · запрос к LLM", unit="запросов",
+    )
     try:
-        completed = subprocess.run(
-            [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(SCHEMA_PATH)],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            cwd=ROOT,
-            timeout=300,
-            check=False,
+        prompt = build_recommendation_prompt({**payload, "content_type": "movie"})
+        if not VENV_PYTHON.exists():
+            raise LlmError("Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt")
+        model = get_model()
+        try:
+            completed = subprocess.run(
+                [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(SCHEMA_PATH)],
+                input=prompt,
+                text=True,
+                capture_output=True,
+                cwd=ROOT,
+                timeout=300,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise LlmError("Codex не успел ответить за 5 минут") from error
+        except OSError as error:
+            raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
+            raise LlmError(f"Codex SDK: {message[-1200:]}")
+        recommendation_progress.finish_stage(progress_id, "llm-request")
+        answer = completed.stdout.strip()
+        if not answer:
+            raise LlmError("Codex вернул пустой ответ")
+        candidates = _parse_response(answer)
+        limit_raw = _optional_number(payload, "limit", 5, 1, 20)
+        requested = int(limit_raw) if limit_raw is not None else 10
+        selected = candidates[:requested]
+        recommendation_progress.set_stage(
+            progress_id, "llm-movie-details", "TMDB / OMDb / Кинопоиск · карточки",
+            len(selected), "фильмов",
         )
-    except subprocess.TimeoutExpired as error:
-        raise LlmError("Codex не успел ответить за 5 минут") from error
-    except OSError as error:
-        raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
-    if completed.returncode != 0:
-        message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
-        raise LlmError(f"Codex SDK: {message[-1200:]}")
-    answer = completed.stdout.strip()
-    if not answer:
-        raise LlmError("Codex вернул пустой ответ")
-    candidates = _parse_response(answer)
-    limit_raw = _optional_number(payload, "limit", 5, 1, 20)
-    requested = int(limit_raw) if limit_raw is not None else 10
-    items, errors = _enrich_movies(candidates[:requested], payload)
-    return {"items": items, "errors": errors, "model": model, "requested": requested, "received": len(candidates)}
+        items, filtered_items, errors = _enrich_movies(selected, payload, progress_id)
+        recommendation_progress.finish_stage(progress_id, "llm-movie-details")
+        return {
+            "items": items, "filtered_items": filtered_items, "errors": errors,
+            "model": model, "requested": requested, "received": len(candidates),
+        }
+    finally:
+        recommendation_progress.finish(progress_id)
 
 
 def _album_line(item: dict[str, Any]) -> str:
@@ -348,11 +420,9 @@ def build_album_prompt(payload: dict[str, Any]) -> str:
         item for item in albums
         if item.get("status") == "consumed" and item.get("reaction") == "like"
     ]
-    liked = [
-        _album_line(item)
-        for item in random.sample(liked_albums, min(liked_sample_size, len(liked_albums)))
-    ]
-    backlog = [_album_line(item) for item in albums if item.get("status") == "backlog"]
+    liked = [_album_line(item) for item in _sample_context(liked_albums, liked_sample_size, payload)]
+    existing_albums = storage.list_library(content_type="music", include_trashed=True)
+    exclusions = [_album_line(item) for item in existing_albums]
     artists = [_artist_line(item) for item in storage.list_music_artists()]
     filters = []
     if year_from is not None and year_to is not None:
@@ -371,7 +441,10 @@ def build_album_prompt(payload: dict[str, Any]) -> str:
         f"Свободный запрос пользователя:\n{user_block}",
         _section("Альбомы, которые понравились пользователю", liked),
         _section("Любимые исполнители (мягкий сигнал; рекомендации не обязаны ограничиваться ими)", artists),
-        _section("Текущий бэклог — эти альбомы нельзя повторять", backlog),
+        _section(
+            "Уже добавленные альбомы, включая бэклог, прослушанное и корзину — не рекомендовать их повторно",
+            exclusions,
+        ),
         "Формат задаётся JSON Schema. Верни только JSON-объект с массивом albums. Для каждого альбома "
         "обязательны title (каноническое название), artist (основной исполнитель), year (целое число) и "
         "comment (комментарий на русском). Не добавляй Markdown или вступление.",
@@ -404,75 +477,305 @@ def _parse_album_response(raw: str) -> list[dict[str, Any]]:
 
 
 def recommend_albums(payload: dict[str, Any]) -> dict[str, Any]:
-    prompt = build_album_prompt(payload)
-    if not VENV_PYTHON.exists():
-        raise LlmError(
-            "Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
-        )
-    model = get_model()
+    progress_id = payload.get("progress_id")
+    recommendation_progress.start(
+        progress_id, 1, stage_id="llm-request", label="Codex · запрос к LLM", unit="запросов",
+    )
     try:
-        completed = subprocess.run(
-            [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(ALBUM_SCHEMA_PATH)],
-            input=prompt, text=True, capture_output=True, cwd=ROOT, timeout=300, check=False,
+        prompt = build_recommendation_prompt({**payload, "content_type": "music"})
+        if not VENV_PYTHON.exists():
+            raise LlmError(
+                "Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+            )
+        model = get_model()
+        try:
+            completed = subprocess.run(
+                [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(ALBUM_SCHEMA_PATH)],
+                input=prompt, text=True, capture_output=True, cwd=ROOT, timeout=300, check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise LlmError("Codex не успел ответить за 5 минут") from error
+        except OSError as error:
+            raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
+            raise LlmError(f"Codex SDK: {message[-1200:]}")
+        recommendation_progress.finish_stage(progress_id, "llm-request")
+        candidates = _parse_album_response(completed.stdout.strip())
+        limit_raw = _optional_number(payload, "limit", 5, 1, 20)
+        requested = int(limit_raw) if limit_raw is not None else 10
+        selected = candidates[:requested]
+        recommendation_progress.set_stage(
+            progress_id, "llm-album-details", "MusicBrainz / Cover Art Archive · карточки",
+            len(selected), "альбомов",
         )
-    except subprocess.TimeoutExpired as error:
-        raise LlmError("Codex не успел ответить за 5 минут") from error
-    except OSError as error:
-        raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
-    if completed.returncode != 0:
-        message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
-        raise LlmError(f"Codex SDK: {message[-1200:]}")
-    candidates = _parse_album_response(completed.stdout.strip())
-    limit_raw = _optional_number(payload, "limit", 5, 1, 20)
-    requested = int(limit_raw) if limit_raw is not None else 10
-    known_ids, known_titles = storage.known_album_keys()
-    items: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for candidate in candidates[:requested]:
-        label = f"{candidate['artist']} — {candidate['title']} ({candidate['year']})"
-        normalized = storage._normalized(candidate["title"])
-        if normalized in known_titles:
-            errors.append({"title": label, "error": "уже есть в библиотеке или корзине"})
-            continue
-        try:
-            found = musicbrainz.search_album(candidate["title"], candidate["artist"], candidate["year"])
-            mbid = str(found.get("release_group_mbid") or "")
-            if not mbid or mbid in known_ids or mbid in seen:
+        known_ids, known_titles = storage.known_album_keys()
+        items: list[dict[str, Any]] = []
+        filtered_items: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for candidate in selected:
+            label = f"{candidate['artist']} — {candidate['title']} ({candidate['year']})"
+            normalized = storage._normalized(candidate["title"])
+            if normalized in known_titles:
                 errors.append({"title": label, "error": "уже есть в библиотеке или корзине"})
+                recommendation_progress.advance(progress_id, "llm-album-details")
                 continue
-            details = musicbrainz.album_details(mbid, fetch_popularity=False)
-            year_from = _optional_number(payload, "year_from", 2023, 1900, date.today().year + 2)
-            year_to = _optional_number(payload, "year_to", date.today().year, 1900, date.today().year + 2)
-            actual_year = details.get("year")
-            if actual_year is None or (year_from is not None and int(actual_year) < int(year_from)) or (
-                year_to is not None and int(actual_year) > int(year_to)
-            ):
-                errors.append({"title": label, "error": "год альбома не соответствует фильтру"})
-                continue
-            details.update({
-                "notes": candidate["comment"],
-                "llm_comment": candidate["comment"],
-                "raw_data": candidate,
+            try:
+                found = musicbrainz.search_album(candidate["title"], candidate["artist"], candidate["year"])
+                mbid = str(found.get("release_group_mbid") or "")
+                if not mbid:
+                    reason = "MusicBrainz ID недоступен"
+                    errors.append({"title": label, "error": reason})
+                    filtered_items.append({"item": _album_candidate_payload(candidate), "reason": reason})
+                    continue
+                if mbid in known_ids:
+                    errors.append({"title": label, "error": "уже есть в библиотеке или корзине"})
+                    continue
+                if mbid in seen:
+                    reason = "дубликат в текущей выдаче"
+                    errors.append({"title": label, "error": reason})
+                    filtered_items.append({"item": _album_candidate_payload(candidate), "reason": reason})
+                    continue
+                details = musicbrainz.album_details(mbid, fetch_popularity=False)
+                details.update({
+                    "notes": candidate["comment"],
+                    "llm_comment": candidate["comment"],
+                    "raw_data": candidate,
+                })
+                year_from = _optional_number(payload, "year_from", 2023, 1900, date.today().year + 2)
+                year_to = _optional_number(payload, "year_to", date.today().year, 1900, date.today().year + 2)
+                actual_year = details.get("year")
+                if actual_year is None or (year_from is not None and int(actual_year) < int(year_from)) or (
+                    year_to is not None and int(actual_year) > int(year_to)
+                ):
+                    reason = "год альбома не соответствует фильтру"
+                    errors.append({"title": label, "error": reason})
+                    filtered_items.append({"item": details, "reason": reason})
+                    continue
+                seen.add(mbid)
+                items.append(details)
+            except Exception as error:
+                reason = str(error)
+                errors.append({"title": label, "error": reason})
+                filtered_items.append({"item": _album_candidate_payload(candidate), "reason": reason})
+            finally:
+                recommendation_progress.advance(progress_id, "llm-album-details")
+        recommendation_progress.finish_stage(progress_id, "llm-album-details")
+        warnings: list[dict[str, str]] = []
+        batch_total = (len(items) + listenbrainz.BATCH_SIZE - 1) // listenbrainz.BATCH_SIZE
+        recommendation_progress.set_stage(
+            progress_id, "llm-listenbrainz", "ListenBrainz · прослушивания",
+            batch_total, "пакетов",
+        )
+        if items:
+            try:
+                if progress_id:
+                    listenbrainz.enrich_albums(
+                        items,
+                        on_batch=lambda: recommendation_progress.advance(progress_id, "llm-listenbrainz"),
+                    )
+                else:
+                    listenbrainz.enrich_albums(items)
+            except listenbrainz.ListenBrainzError as error:
+                warnings.append({"provider": "listenbrainz", "message": str(error)})
+                recommendation_progress.add_warning(progress_id, "ListenBrainz", str(error))
+        recommendation_progress.finish_stage(progress_id, "llm-listenbrainz")
+        if errors:
+            warnings.append({
+                "provider": "musicbrainz",
+                "message": f"Не удалось уточнить {len(errors)} рекомендаций через MusicBrainz.",
             })
-            seen.add(mbid)
-            items.append(details)
-        except Exception as error:
-            errors.append({"title": label, "error": str(error)})
-    warnings = []
-    if items:
-        try:
-            listenbrainz.enrich_albums(items)
-        except listenbrainz.ListenBrainzError as error:
-            warnings.append({"provider": "listenbrainz", "message": str(error)})
-    if errors:
-        warnings.append({
-            "provider": "musicbrainz",
-            "message": f"Не удалось уточнить {len(errors)} рекомендаций через MusicBrainz.",
-        })
-    for item in items:
-        item["provider_warnings"] = item.get("provider_warnings", []) + warnings
+        for item in items:
+            item["provider_warnings"] = item.get("provider_warnings", []) + warnings
+        return {
+            "items": items, "filtered_items": filtered_items, "errors": errors, "model": model,
+            "requested": requested, "received": len(candidates), "provider_warnings": warnings,
+        }
+    finally:
+        recommendation_progress.finish(progress_id)
+
+
+def build_recommendation_prompt(payload: dict[str, Any]) -> str:
+    contract = build_album_prompt(payload) if payload.get("content_type") == "music" else build_movie_prompt(payload)
+    return (
+        f"{BASE_INSTRUCTIONS}\n\n"
+        "The following recommendation contract is mandatory system-level context. "
+        "Apply every enabled filter before choosing recommendations:\n\n"
+        f"{contract}"
+    )
+
+
+def build_people_prompt(payload: dict[str, Any]) -> str:
+    content_type = str(payload.get("content_type") or "movie")
+    if content_type not in {"movie", "music"}:
+        raise LlmError("Неизвестный тип контента")
+    user_prompt = str(payload.get("prompt") or "").strip()
+    if len(user_prompt) > 8000:
+        raise LlmError("Пользовательский промпт слишком длинный")
+    existing = storage.list_interests(content_type, include_trashed=True)
+    existing_lines = [
+        _artist_line(person) if content_type == "music" else _person_line(person)
+        for person in existing
+    ]
+    if content_type == "music":
+        task = (
+            "Задача: порекомендуй исполнителей или музыкальные группы по запросу пользователя. "
+            "Для каждой рекомендации укажи каноническое имя в name_original, наиболее употребимое "
+            "русское написание в name_ru, role=artist и короткий содержательный comment на русском."
+        )
+        entity_label = "исполнителей"
+        format_note = "Для всех элементов поле role должно быть равно artist."
+    else:
+        task = (
+            "Задача: порекомендуй актёров и/или режиссёров по запросу пользователя. Для каждой рекомендации "
+            "укажи оригинальное имя в name_original, наиболее употребимое русское имя в name_ru, роль actor "
+            "или director и короткий содержательный comment на русском."
+        )
+        entity_label = "персон"
+        format_note = "Поле role должно быть actor для актёра или director для режиссёра."
+    user_block = user_prompt or "Дополнительных пожеланий нет — подбери наиболее релевантные рекомендации."
+    return "\n\n".join([
+        task,
+        "Верни не более 10 наиболее релевантных позиций. Не предлагай никого из уже добавленных списков, "
+        "включая объекты в корзине. Не заменяй уже добавленную персону вариантом написания того же имени.",
+        f"Свободный запрос пользователя:\n{user_block}",
+        _section(
+            f"Уже добавленные {entity_label}, включая корзину — не рекомендовать повторно",
+            existing_lines,
+        ),
+        "Формат ответа задаётся JSON Schema. Верни только JSON-объект с массивом people. "
+        f"{format_note} Не добавляй Markdown, вступление или вопросы пользователю.",
+    ])
+
+
+def build_people_recommendation_prompt(payload: dict[str, Any]) -> str:
+    return (
+        f"{BASE_INSTRUCTIONS}\n\n"
+        "The following people recommendation contract is mandatory system-level context:\n\n"
+        f"{build_people_prompt(payload)}"
+    )
+
+
+def _parse_people_response(raw: str, content_type: str) -> list[dict[str, str]]:
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise LlmError(f"Codex вернул ответ, который не удалось разобрать как JSON: {error}") from error
+    people = response.get("people") if isinstance(response, dict) else None
+    if not isinstance(people, list):
+        raise LlmError("Codex вернул JSON без массива people")
+    parsed: list[dict[str, str]] = []
+    allowed_roles = {"artist"} if content_type == "music" else {"actor", "director"}
+    for index, person in enumerate(people, start=1):
+        if not isinstance(person, dict):
+            raise LlmError(f"Позиция {index} в ответе Codex имеет неверный формат")
+        item = {
+            "name_original": str(person.get("name_original") or "").strip(),
+            "name_ru": str(person.get("name_ru") or "").strip(),
+            "role": str(person.get("role") or "").strip(),
+            "comment": str(person.get("comment") or "").strip(),
+        }
+        if not item["name_original"] or not item["name_ru"] or not item["comment"]:
+            raise LlmError(f"У позиции {index} не заполнены обязательные поля")
+        if item["role"] not in allowed_roles:
+            raise LlmError(f"У позиции {index} указана неподходящая роль")
+        parsed.append(item)
+    return parsed
+
+
+def _person_name_keys(person: dict[str, Any]) -> set[str]:
     return {
-        "items": items, "errors": errors, "model": model,
-        "requested": requested, "received": len(candidates), "provider_warnings": warnings,
+        normalized
+        for field in ("name", "name_original", "name_ru")
+        if (normalized := storage._normalized(str(person.get(field) or "")))
     }
+
+
+def recommend_people(payload: dict[str, Any]) -> dict[str, Any]:
+    content_type = str(payload.get("content_type") or "movie")
+    if content_type not in {"movie", "music"}:
+        raise LlmError("Неизвестный тип контента")
+    progress_id = payload.get("progress_id")
+    recommendation_progress.start(
+        progress_id, 1, stage_id="llm-request", label="Codex · запрос к LLM", unit="запросов",
+    )
+    try:
+        prompt = build_people_recommendation_prompt(payload)
+        if not VENV_PYTHON.exists():
+            raise LlmError(
+                "Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+            )
+        model = get_model()
+        try:
+            completed = subprocess.run(
+                [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(PERSON_SCHEMA_PATH)],
+                input=prompt, text=True, capture_output=True, cwd=ROOT, timeout=300, check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise LlmError("Codex не успел ответить за 5 минут") from error
+        except OSError as error:
+            raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
+            raise LlmError(f"Codex SDK: {message[-1200:]}")
+        recommendation_progress.finish_stage(progress_id, "llm-request")
+        candidates = _parse_people_response(completed.stdout.strip(), content_type)[:10]
+        provider = "MusicBrainz" if content_type == "music" else "TMDB"
+        stage_id = "musicbrainz-people" if content_type == "music" else "tmdb-people"
+        recommendation_progress.set_stage(
+            progress_id, stage_id, f"{provider} · карточки персон", len(candidates), "персон",
+        )
+        existing = storage.list_interests(content_type, include_trashed=True)
+        known_names = set().union(*(_person_name_keys(person) for person in existing)) if existing else set()
+        id_field = "mbid" if content_type == "music" else "tmdb_id"
+        known_ids = {
+            str(person.get(id_field) or person.get("external_id") or "")
+            for person in existing
+            if person.get(id_field) or person.get("external_id")
+        }
+        seen_names: set[str] = set()
+        seen_ids: set[str] = set()
+        items: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for candidate in candidates:
+            label = candidate["name_ru"] or candidate["name_original"]
+            candidate_names = _person_name_keys(candidate)
+            try:
+                if candidate_names & (known_names | seen_names):
+                    errors.append({"title": label, "error": "уже есть в списке или корзине"})
+                    continue
+                if content_type == "music":
+                    details = musicbrainz.resolve_artist_input({
+                        "content_type": "music", "name": candidate["name_original"],
+                    })
+                    details["content_type"] = "music"
+                    details["role"] = "artist"
+                else:
+                    details = tmdb.resolve_person_input(candidate)
+                    details["content_type"] = "movie"
+                external_id = str(details.get(id_field) or details.get("external_id") or "")
+                resolved_names = _person_name_keys(details)
+                if (external_id and external_id in known_ids | seen_ids) or resolved_names & (known_names | seen_names):
+                    errors.append({"title": label, "error": "уже есть в списке или корзине"})
+                    continue
+                details.update({
+                    "notes": candidate["comment"],
+                    "llm_comment": candidate["comment"],
+                    "raw_data": candidate,
+                })
+                if external_id:
+                    seen_ids.add(external_id)
+                seen_names.update(candidate_names | resolved_names)
+                items.append(details)
+            except Exception as error:
+                errors.append({"title": label, "error": str(error)})
+            finally:
+                recommendation_progress.advance(progress_id, stage_id)
+        recommendation_progress.finish_stage(progress_id, stage_id)
+        return {
+            "items": items, "errors": errors, "model": model,
+            "requested": 10, "received": len(candidates),
+        }
+    finally:
+        recommendation_progress.finish(progress_id)

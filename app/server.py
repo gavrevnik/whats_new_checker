@@ -22,7 +22,7 @@ from app import artwork, listenbrainz, llm, musicbrainz, recommendation_progress
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PID_FILE = Path(__file__).resolve().parents[1] / ".runtime" / "server.pid"
-APP_VERSION = 27
+APP_VERSION = 30
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -231,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"item": musicbrainz.refresh_artist(person_id)})
                 return
             if parsed.path == "/api/recommendations/tmdb":
-                self._json({"items": tmdb.recommend_movies(payload)})
+                self._json(tmdb.recommend_movies(payload))
                 return
             if parsed.path == "/api/recommendations/llm":
                 self._json(
@@ -239,6 +239,12 @@ class Handler(BaseHTTPRequestHandler):
                     if payload.get("content_type") == "music"
                     else llm.recommend_movies(payload)
                 )
+                return
+            if parsed.path == "/api/recommendations/people/llm":
+                self._json(llm.recommend_people(payload))
+                return
+            if parsed.path == "/api/recommendations/prompt":
+                self._json({"prompt": llm.build_recommendation_prompt(payload)})
                 return
             if parsed.path == "/api/recommendations/musicbrainz":
                 self._json(musicbrainz.recommend_albums(payload))

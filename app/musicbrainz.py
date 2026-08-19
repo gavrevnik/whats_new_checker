@@ -118,8 +118,8 @@ def _cover_art_url(release_group_mbid: str) -> str:
         if not isinstance(image, dict) or image.get("front") is not True:
             continue
         thumbnails = image.get("thumbnails") if isinstance(image.get("thumbnails"), dict) else {}
-        if thumbnails.get("500") or thumbnails.get("large"):
-            cover_url = f"{COVER_ART_BASE_URL}/release-group/{mbid}/front-500"
+        if thumbnails.get("250") or thumbnails.get("small"):
+            cover_url = artwork.album_cover_url(mbid)
             try:
                 with urllib.request.urlopen(
                     urllib.request.Request(cover_url, headers={"User-Agent": USER_AGENT}, method="HEAD"),
@@ -547,6 +547,7 @@ def browse_artist_albums(
     year_to: int,
     *,
     studio_albums_only: bool = False,
+    include_filtered: bool = False,
 ) -> list[dict[str, Any]]:
     response = _request_json(
         "release-group",
@@ -564,11 +565,11 @@ def browse_artist_albums(
             continue
         item = _release_group_payload(raw)
         item_year = item.get("year")
-        if item.get("primary_type").casefold() != "album".casefold():
+        if not include_filtered and item.get("primary_type").casefold() != "album".casefold():
             continue
-        if studio_albums_only and item.get("secondary_types"):
+        if not include_filtered and studio_albums_only and item.get("secondary_types"):
             continue
-        if not item_year or not year_from <= int(item_year) <= year_to:
+        if not include_filtered and (not item_year or not year_from <= int(item_year) <= year_to):
             continue
         results.append(item)
     return results
@@ -596,6 +597,11 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
         for value in (filters.get("excluded_types") or [])
         if str(value).strip()
     }
+    excluded_title_terms = [
+        (storage._normalized(str(value)), str(value).strip())
+        for value in (filters.get("excluded_title_terms") or [])
+        if storage._normalized(str(value))
+    ]
     selected_ids = {str(value) for value in (filters.get("artist_ids") or [])}
     artists = storage.list_music_artists()
     if "artist_ids" in filters:
@@ -610,14 +616,38 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
     )
     known_ids, known_titles = storage.known_album_keys()
     candidates: dict[str, dict[str, Any]] = {}
+    filtered_items: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for artist in artists:
         try:
-            for item in browse_artist_albums(str(artist["mbid"]), year_from, year_to):
+            for item in browse_artist_albums(
+                str(artist["mbid"]), year_from, year_to, include_filtered=True,
+            ):
                 mbid = str(item.get("release_group_mbid") or "")
                 normalized = storage._normalized(str(item.get("title_original") or ""))
                 secondary = {str(value).casefold() for value in item.get("secondary_types", [])}
-                if not mbid or mbid in known_ids or normalized in known_titles or secondary & excluded:
+                if mbid in known_ids or normalized in known_titles:
+                    continue
+                reasons: list[str] = []
+                if not mbid:
+                    reasons.append("MusicBrainz ID недоступен")
+                item_year = item.get("year")
+                if not item_year or not year_from <= int(item_year) <= year_to:
+                    reasons.append(f"год выпуска вне диапазона {year_from}–{year_to} или недоступен")
+                primary_type = str(item.get("primary_type") or "")
+                if primary_type and primary_type.casefold() != "album":
+                    reasons.append("основной тип релиза не Album")
+                excluded_secondary = [
+                    str(value) for value in item.get("secondary_types", [])
+                    if str(value).casefold() in excluded
+                ]
+                if excluded_secondary:
+                    reasons.append(f"исключённый тип: {', '.join(excluded_secondary)}")
+                excluded_terms = [label for term, label in excluded_title_terms if term in normalized]
+                if excluded_terms:
+                    reasons.append(f"название содержит: {', '.join(excluded_terms)}")
+                if reasons:
+                    filtered_items.append({"item": item, "reason": "; ".join(reasons)})
                     continue
                 candidates.setdefault(mbid, item)
         except Exception as error:
@@ -648,7 +678,9 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
                 progress_id=progress_id,
             ))
         except Exception as error:
-            errors.append({"title": str(candidate.get("title_original") or "Album"), "error": str(error)})
+            reason = str(error)
+            errors.append({"title": str(candidate.get("title_original") or "Album"), "error": reason})
+            filtered_items.append({"item": candidate, "reason": reason})
             recommendation_progress.advance(progress_id, "cover-art")
             recommendation_progress.add_warning(progress_id, "MusicBrainz", str(error))
     recommendation_progress.finish_stage(progress_id, "musicbrainz-details")
@@ -695,4 +727,7 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
     for item in items:
         item["provider_warnings"] = item.get("provider_warnings", []) + warnings
     recommendation_progress.finish(progress_id)
-    return {"items": items, "errors": errors, "provider_warnings": combined_warnings}
+    return {
+        "items": items, "filtered_items": filtered_items,
+        "errors": errors, "provider_warnings": combined_warnings,
+    }

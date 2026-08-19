@@ -63,8 +63,21 @@ class LlmTests(unittest.TestCase):
              patch.object(llm.storage, "list_interests", return_value=[]), \
              patch.object(llm.random, "sample", side_effect=lambda values, count: values[:count]):
             prompt = llm.build_movie_prompt({"year_to":"2026", "liked_sample_size":"30"})
-        self.assertIn("Фильм 29 (Movie 29)", prompt)
-        self.assertNotIn("Фильм 30 (Movie 30)", prompt)
+        liked_section = prompt.split("Фильмы, которые понравились пользователю:", 1)[1].split(
+            "Любимые актёры и режиссёры", 1
+        )[0]
+        self.assertIn("Фильм 29 (Movie 29)", liked_section)
+        self.assertNotIn("Фильм 30 (Movie 30)", liked_section)
+
+    def test_movie_prompt_explicitly_excludes_trashed_movies(self) -> None:
+        trashed = storage.add_item({
+            "title_original":"Gone Movie", "title_ru":"Удалённый фильм", "year":"2022",
+            "status":"backlog",
+        })
+        storage.trash_entity({"entity_type":"movie", "id":trashed["id"]})
+        prompt = llm.build_movie_prompt({"year_to":"2026"})
+        self.assertIn("включая бэклог, просмотренное и корзину", prompt)
+        self.assertIn("Удалённый фильм (Gone Movie)", prompt)
 
     def test_rejects_inverted_year_range(self) -> None:
         with self.assertRaises(llm.LlmError):
@@ -82,6 +95,15 @@ class LlmTests(unittest.TestCase):
         self.assertNotIn("длительность не меньше", prompt)
         self.assertEqual(llm._passes_filters({"year":"2024"}, payload), "")
 
+    def test_prompt_preview_is_the_complete_system_prompt(self) -> None:
+        prompt = llm.build_recommendation_prompt({
+            "content_type":"movie", "prompt":"Тихая фантастика", "year_to":"2026",
+            "context_seed":"stable-preview",
+        })
+        self.assertTrue(prompt.startswith("You are a personal movie and music recommendation assistant."))
+        self.assertIn("mandatory system-level context", prompt)
+        self.assertIn("Тихая фантастика", prompt)
+
     def test_recommendation_invokes_isolated_sdk_runner(self) -> None:
         response = {"movies":[{
             "title_ru":"Тест", "title_original":"Test", "year":2024, "comment":"Подходит по настроению",
@@ -97,7 +119,10 @@ class LlmTests(unittest.TestCase):
              patch.object(llm.tmdb, "resolve_movie", return_value=999), \
              patch.object(llm.tmdb, "movie_details", return_value=details), \
              patch.object(llm.subprocess, "run", return_value=completed) as run:
-            result = llm.recommend_movies({"prompt":"Научная фантастика", "year_to":"2026", "limit":"1"})
+            result = llm.recommend_movies({
+                "prompt":"Научная фантастика", "year_to":"2026", "limit":"1",
+                "progress_id":"llm-movie-job",
+            })
         self.assertEqual(result["items"][0]["notes"], "Подходит по настроению")
         self.assertEqual(result["items"][0]["tmdb_id"], 999)
         self.assertEqual(result["errors"], [])
@@ -108,6 +133,9 @@ class LlmTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("--model") + 1], "test-model")
         self.assertEqual(command[command.index("--schema") + 1], str(llm.SCHEMA_PATH))
+        progress = llm.recommendation_progress.get("llm-movie-job")
+        self.assertEqual([stage["id"] for stage in progress["stages"]], ["llm-request", "llm-movie-details"])
+        self.assertTrue(progress["complete"])
 
     def test_recommendation_skips_movies_that_fail_verified_filters(self) -> None:
         response = {"movies":[{
@@ -126,6 +154,39 @@ class LlmTests(unittest.TestCase):
             result = llm.recommend_movies({"year_to":"2026", "limit":"1", "min_runtime":"100"})
         self.assertEqual(result["items"], [])
         self.assertIn("длительность меньше 100", result["errors"][0]["error"])
+        self.assertEqual(result["filtered_items"][0]["item"]["tmdb_id"], 1000)
+        self.assertIn("длительность меньше 100", result["filtered_items"][0]["reason"])
+
+    def test_existing_movie_is_not_returned_as_filtered(self) -> None:
+        candidate = {
+            "title_ru":"Дюна: Часть вторая", "title_original":"Dune: Part Two",
+            "year":2024, "comment":"Уже добавлен",
+        }
+        with patch.object(llm.tmdb, "get_api_key", return_value=("test-key", "test")), \
+             patch.object(llm, "_enrich_candidate") as enrich:
+            items, filtered_items, errors = llm._enrich_movies([candidate], {})
+        self.assertEqual(items, [])
+        self.assertEqual(filtered_items, [])
+        self.assertIn("уже есть", errors[0]["error"])
+        enrich.assert_not_called()
+
+    def test_enriched_existing_movie_stays_out_of_filtered_results(self) -> None:
+        candidate = {
+            "title_ru":"Песчаная планета", "title_original":"Sand Planet",
+            "year":2024, "comment":"Другое название",
+        }
+        existing_details = {
+            "title_ru":"Дюна: Часть вторая", "title_original":"Dune: Part Two",
+            "year":2024, "tmdb_id":900, "duration_minutes":80,
+        }
+        with patch.object(llm.tmdb, "get_api_key", return_value=("test-key", "test")), \
+             patch.object(llm, "_enrich_candidate", return_value=existing_details):
+            items, filtered_items, errors = llm._enrich_movies(
+                [candidate], {"min_runtime":"100"},
+            )
+        self.assertEqual(items, [])
+        self.assertEqual(filtered_items, [])
+        self.assertIn("уже есть", errors[0]["error"])
 
     def test_missing_kinopoisk_rating_does_not_discard_tmdb_card(self) -> None:
         item = {"imdb_rating":7.5, "kinopoisk_rating":None, "year":"2024", "duration_minutes":120}
@@ -155,6 +216,7 @@ class LlmTests(unittest.TestCase):
             result = llm.recommend_movies({"year_to":"2026", "limit":"1"})
         self.assertEqual(result["items"], [])
         self.assertIn("TMDB", result["errors"][0]["error"])
+        self.assertEqual(result["filtered_items"][0]["item"]["title_original"], "Test")
 
     def test_rejects_unstructured_model_response(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "1. Тест (Test)", "")
@@ -191,6 +253,16 @@ class LlmTests(unittest.TestCase):
         self.assertIn("Хочу арт-рок", prompt)
         self.assertIn("массивом albums", prompt)
 
+    def test_album_prompt_explicitly_excludes_trashed_albums(self) -> None:
+        trashed = storage.add_item({
+            "content_type":"music", "title_original":"Gone Album", "title_ru":"Gone Album",
+            "artists":"Artist", "year":"2024", "status":"backlog", "release_group_mbid":"rg-gone",
+        })
+        storage.trash_entity({"entity_type":"album", "id":trashed["id"]})
+        prompt = llm.build_album_prompt({"year_to":"2026"})
+        self.assertIn("включая бэклог, прослушанное и корзину", prompt)
+        self.assertIn("Gone Album — Artist, 2024", prompt)
+
     def test_album_recommendation_is_enriched_through_musicbrainz(self) -> None:
         response = {"albums":[{"title":"Album","artist":"Artist","year":2024,"comment":"Подходит"}]}
         completed = subprocess.CompletedProcess([], 0, json.dumps(response, ensure_ascii=False), "")
@@ -211,6 +283,67 @@ class LlmTests(unittest.TestCase):
         self.assertEqual(command[command.index("--schema") + 1], str(llm.ALBUM_SCHEMA_PATH))
         album_details.assert_called_once_with("rg-1", fetch_popularity=False)
         popularity.assert_called_once_with(result["items"])
+
+    def test_people_prompts_include_existing_and_trashed_people(self) -> None:
+        actor = storage.add_interest_person({
+            "role":"actor", "name_original":"Tilda Swinton", "name_ru":"Тильда Суинтон", "tmdb_id":3063,
+        })
+        storage.trash_entity({"entity_type":"person", "entity_id":actor["id"], "role":"actor"})
+        artist = storage.add_music_artist({"content_type":"music", "name":"Portishead", "mbid":"artist-portishead"})
+        storage.trash_entity({"entity_type":"music_artist", "entity_id":artist["id"]})
+
+        movie_prompt = llm.build_people_prompt({"content_type":"movie", "prompt":"Необычные актёры"})
+        music_prompt = llm.build_people_prompt({"content_type":"music", "prompt":"Мрачный трип-хоп"})
+
+        self.assertIn("Дэвид Финчер (David Fincher)", movie_prompt)
+        self.assertIn("Тильда Суинтон (Tilda Swinton)", movie_prompt)
+        self.assertIn("включая корзину", movie_prompt)
+        self.assertIn("Portishead", music_prompt)
+        self.assertIn("Мрачный трип-хоп", music_prompt)
+
+    def test_movie_person_recommendation_is_resolved_through_tmdb(self) -> None:
+        response = {"people":[{
+            "name_original":"Jane Campion", "name_ru":"Джейн Кэмпион",
+            "role":"director", "comment":"Подходит по авторскому стилю",
+        }]}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(response, ensure_ascii=False), "")
+        details = {
+            "name_original":"Jane Campion", "name_ru":"Джейн Кэмпион",
+            "role":"director", "tmdb_id":100,
+        }
+        with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
+             patch.object(llm, "get_model", return_value="test-model"), \
+             patch.object(llm.subprocess, "run", return_value=completed) as run, \
+             patch.object(llm.tmdb, "resolve_person_input", return_value=details) as resolve:
+            result = llm.recommend_people({
+                "content_type":"movie", "prompt":"Женщины-режиссёры", "progress_id":"people-movie-job",
+            })
+        self.assertEqual(result["items"][0]["tmdb_id"], 100)
+        self.assertEqual(result["items"][0]["notes"], "Подходит по авторскому стилю")
+        resolve.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--schema") + 1], str(llm.PERSON_SCHEMA_PATH))
+        progress = llm.recommendation_progress.get("people-movie-job")
+        self.assertEqual([stage["id"] for stage in progress["stages"]], ["llm-request", "tmdb-people"])
+        self.assertTrue(progress["complete"])
+
+    def test_music_artist_recommendation_is_resolved_through_musicbrainz(self) -> None:
+        response = {"people":[{
+            "name_original":"Massive Attack", "name_ru":"Massive Attack",
+            "role":"artist", "comment":"Атмосферный трип-хоп",
+        }]}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(response, ensure_ascii=False), "")
+        details = {
+            "content_type":"music", "name":"Massive Attack", "name_original":"Massive Attack",
+            "name_ru":"Massive Attack", "mbid":"artist-massive-attack", "artist_type":"Group",
+        }
+        with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
+             patch.object(llm.subprocess, "run", return_value=completed), \
+             patch.object(llm.musicbrainz, "resolve_artist_input", return_value=details) as resolve:
+            result = llm.recommend_people({"content_type":"music", "prompt":"Трип-хоп"})
+        self.assertEqual(result["items"][0]["mbid"], "artist-massive-attack")
+        self.assertEqual(result["items"][0]["role"], "artist")
+        resolve.assert_called_once_with({"content_type":"music", "name":"Massive Attack"})
 
 
 if __name__ == "__main__":

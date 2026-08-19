@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -48,7 +49,7 @@ class TmdbTests(unittest.TestCase):
         self.assertEqual(result["awards_json"][0]["summary"],"2 wins")
         self.assertEqual(result["kinopoisk_rating"],8.5)
 
-    def test_kinopoisk_uses_single_title_lookup_and_maps_rating(self) -> None:
+    def test_kinopoisk_uses_imdb_lookup_first_and_maps_rating(self) -> None:
         payload = {"items":[{
             "kinopoiskId":301, "imdbId":"tt0133093", "nameRu":"Матрица",
             "nameOriginal":"The Matrix", "year":1999, "ratingKinopoisk":8.5,
@@ -57,8 +58,9 @@ class TmdbTests(unittest.TestCase):
              patch.object(tmdb,"_request_json",return_value=payload) as request:
             result = tmdb._get_kinopoisk("tt0133093","The Matrix","Матрица",1999)
         url, headers = request.call_args.args
-        self.assertIn("keyword=", url)
-        self.assertNotIn("imdbId=", url)
+        self.assertIn("imdbId=tt0133093", url)
+        self.assertNotIn("keyword=", url)
+        self.assertEqual(request.call_count, 1)
         self.assertEqual(headers["X-API-KEY"], "kp-key")
         self.assertEqual(result["kinopoisk_id"], 301)
         self.assertEqual(result["kinopoisk_rating"], 8.5)
@@ -84,10 +86,45 @@ class TmdbTests(unittest.TestCase):
             "nameOriginal":"The Tree of Life", "year":2010, "ratingKinopoisk":6.6,
         }]}
         with patch.object(tmdb,"get_kinopoisk_key",return_value=("kp-key","test")), \
-             patch.object(tmdb,"_request_json",return_value=payload):
+             patch.object(tmdb,"_request_json",side_effect=[{"items":[]},payload]) as request:
             result = tmdb._get_kinopoisk("tt0478304","The Tree of Life","Древо жизни",2011)
         self.assertEqual(result["kinopoisk_id"], 256408)
         self.assertEqual(result["kinopoisk_rating"], 6.6)
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("imdbId=tt0478304", request.call_args_list[0].args[0])
+        self.assertIn("keyword=", request.call_args_list[1].args[0])
+
+    def test_kinopoisk_fallback_normalizes_yo_in_russian_title(self) -> None:
+        payload = {"items":[{
+            "kinopoiskId":7649, "imdbId":"tt0156701", "nameRu":"Хрусталев, машину!",
+            "nameOriginal":None, "year":1998, "ratingKinopoisk":7.3,
+        }]}
+        with patch.object(tmdb,"get_kinopoisk_key",return_value=("kp-key","test")), \
+             patch.object(tmdb,"_request_json",side_effect=[{"items":[]},payload]) as request:
+            result = tmdb._get_kinopoisk(
+                "tt0156701", "Хрусталёв, машину!", "Хрусталёв, машину!", 1999,
+            )
+        fallback_url = request.call_args_list[1].args[0]
+        fallback_query = urllib.parse.parse_qs(urllib.parse.urlparse(fallback_url).query)
+        self.assertEqual(fallback_query["keyword"], ["Хрусталев, машину!"])
+        self.assertEqual(fallback_query["yearFrom"], ["1998"])
+        self.assertEqual(fallback_query["yearTo"], ["2000"])
+        self.assertEqual(result["kinopoisk_id"], 7649)
+        self.assertEqual(result["kinopoisk_rating"], 7.3)
+
+    def test_kinopoisk_falls_back_to_title_after_imdb_request_error(self) -> None:
+        payload = {"items":[{
+            "kinopoiskId":7649, "imdbId":"tt0156701", "nameRu":"Хрусталев, машину!",
+            "nameOriginal":None, "year":1998, "ratingKinopoisk":7.3,
+        }]}
+        with patch.object(tmdb,"get_kinopoisk_key",return_value=("kp-key","test")), \
+             patch.object(tmdb,"_request_json",side_effect=[tmdb.TmdbError("temporary failure"),payload]) as request:
+            result = tmdb._get_kinopoisk(
+                "tt0156701", "Хрусталёв, машину!", "Хрусталёв, машину!", 1999,
+            )
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(result["kinopoisk_rating"], 7.3)
+        self.assertNotIn("provider_warnings", result)
 
     def test_kinopoisk_quota_error_becomes_non_fatal_warning(self) -> None:
         with patch.object(tmdb,"get_kinopoisk_key",return_value=("kp-key","test")), \
@@ -264,7 +301,11 @@ class TmdbTests(unittest.TestCase):
                 "actor_ids":["actor-one"], "date_from":"2020-01-01", "date_to":"2025-12-31",
                 "excluded_genres":["Animation","Documentary"], "min_tmdb_rating":9, "limit":20,
             })
-        self.assertEqual([item["tmdb_id"] for item in result], [3])
+        self.assertEqual([item["tmdb_id"] for item in result["items"]], [3])
+        self.assertEqual(
+            {record["item"]["tmdb_id"] for record in result["filtered_items"]},
+            {1, 2, 4},
+        )
         enrich.assert_called_once_with(3, "key")
 
     def test_api_recommendations_filter_by_kinopoisk_rating(self) -> None:
@@ -277,7 +318,35 @@ class TmdbTests(unittest.TestCase):
              patch.object(tmdb,"_get",return_value=credits), \
              patch.object(tmdb,"movie_details",return_value=details):
             result = tmdb.recommend_movies({"actor_ids":["actor-one"],"min_kinopoisk_rating":7})
-        self.assertEqual(result, [])
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["filtered_items"][0]["item"]["tmdb_id"], 3)
+        self.assertIn("Кинопоиска ниже 7", result["filtered_items"][0]["reason"])
+
+    def test_existing_api_movie_is_not_returned_as_filtered(self) -> None:
+        credits = {"cast":[{"id":3,"title":"Драма","original_title":"Drama","release_date":"2024-06-01","genre_ids":[18],"vote_average":8,"vote_count":500}]}
+        interests = lambda _content, role: [{"id":"actor-one","external_id":10,"role":"actor"}] if role == "actor" else []
+        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb.storage,"list_interests",side_effect=interests), \
+             patch.object(tmdb.storage,"known_movie_keys",return_value=({"3"},{"drama","drama:2024"})), \
+             patch.object(tmdb,"_get",return_value=credits), \
+             patch.object(tmdb,"movie_details") as details:
+            result = tmdb.recommend_movies({"actor_ids":["actor-one"]})
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["filtered_items"], [])
+        details.assert_not_called()
+
+    def test_existing_movie_detected_after_enrichment_is_not_filtered(self) -> None:
+        credits = {"cast":[{"id":3,"title":"Другое имя","original_title":"Different Name","release_date":"2024-06-01","genre_ids":[18],"vote_average":8,"vote_count":500}]}
+        enriched = {"tmdb_id":3,"title_ru":"Драма","title_original":"Drama","year":2024,"duration_minutes":80,"imdb_rating":5,"genres":"драма"}
+        interests = lambda _content, role: [{"id":"actor-one","external_id":10,"role":"actor"}] if role == "actor" else []
+        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb.storage,"list_interests",side_effect=interests), \
+             patch.object(tmdb.storage,"known_movie_keys",return_value=(set(),{"drama","drama:2024"})), \
+             patch.object(tmdb,"_get",return_value=credits), \
+             patch.object(tmdb,"movie_details",return_value=enriched):
+            result = tmdb.recommend_movies({"actor_ids":["actor-one"],"min_runtime":100,"min_imdb_rating":7})
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["filtered_items"], [])
 
 
 if __name__ == "__main__":

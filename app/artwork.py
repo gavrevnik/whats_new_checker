@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import re
 import tempfile
 import urllib.error
 import urllib.request
@@ -12,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTWORK_DIR = ROOT / "data" / "artwork"
 USER_AGENT = "whats-new-checker/2.1 (gavrevns@gmail.com)"
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
+ALBUM_COVER_SIZE = 250
+MOVIE_POSTER_SIZE = "w185"
 
 
 class ArtworkError(RuntimeError):
@@ -20,7 +23,7 @@ class ArtworkError(RuntimeError):
 
 def album_cover_url(release_group_mbid: str) -> str:
     mbid = str(release_group_mbid or "").strip()
-    return f"https://coverartarchive.org/release-group/{mbid}/front-500" if mbid else ""
+    return f"https://coverartarchive.org/release-group/{mbid}/front-{ALBUM_COVER_SIZE}" if mbid else ""
 
 
 def movie_poster_url(poster_path: str) -> str:
@@ -28,8 +31,17 @@ def movie_poster_url(poster_path: str) -> str:
     if not path:
         return ""
     if path.startswith("http://") or path.startswith("https://"):
+        if "image.tmdb.org/t/p/" in path:
+            return re.sub(r"(/t/p/)[^/]+/", rf"\g<1>{MOVIE_POSTER_SIZE}/", path, count=1)
         return path
-    return f"https://image.tmdb.org/t/p/w500/{path.lstrip('/')}"
+    return f"https://image.tmdb.org/t/p/{MOVIE_POSTER_SIZE}/{path.lstrip('/')}"
+
+
+def preferred_album_cover_url(release_group_mbid: str, cover_url: str = "") -> str:
+    url = str(cover_url or "").strip()
+    if "coverartarchive.org/release-group/" in url:
+        return re.sub(r"/front(?:-(?:250|500|1200))?$", f"/front-{ALBUM_COVER_SIZE}", url)
+    return url or album_cover_url(release_group_mbid)
 
 
 def _safe_identifier(value: object) -> str:
@@ -110,20 +122,22 @@ def _download(url: str, destination: Path) -> bool:
                 pass
 
 
-def cache_album_cover(release_group_mbid: str, cover_url: str = "") -> str:
+def cache_album_cover(release_group_mbid: str, cover_url: str = "", *, force: bool = False) -> str:
     relative = _relative_path("album", release_group_mbid)
     destination = resolve_local_path(relative)
-    if destination.is_file():
+    if destination.is_file() and not force:
         return relative
-    return relative if _download(cover_url or album_cover_url(release_group_mbid), destination) else ""
+    return relative if _download(preferred_album_cover_url(release_group_mbid, cover_url), destination) else ""
 
 
-def cache_movie_poster(tmdb_id: object, poster_path: str = "", poster_url: str = "") -> str:
+def cache_movie_poster(
+    tmdb_id: object, poster_path: str = "", poster_url: str = "", *, force: bool = False,
+) -> str:
     relative = _relative_path("movie", tmdb_id)
     destination = resolve_local_path(relative)
-    if destination.is_file():
+    if destination.is_file() and not force:
         return relative
-    return relative if _download(poster_url or movie_poster_url(poster_path), destination) else ""
+    return relative if _download(movie_poster_url(poster_url or poster_path), destination) else ""
 
 
 def content_type(relative_path: str) -> str:

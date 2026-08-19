@@ -627,15 +627,18 @@ def set_favorite(item_id: str, favorite: bool) -> dict[str, Any]:
     return get_item(item_id)
 
 
-def list_interests(content_type: str | None = None, role: str | None = None) -> list[dict[str, Any]]:
+def list_interests(
+    content_type: str | None = None, role: str | None = None, include_trashed: bool = False,
+) -> list[dict[str, Any]]:
     if content_type == "music":
-        return list_music_artists()
+        return list_music_artists(include_trashed=include_trashed)
     initialize_database()
-    clauses = [
-        "p.active = 1",
-        "NOT EXISTS (SELECT 1 FROM trash_entries t WHERE t.entity_type = 'person' "
-        "AND t.entity_id = p.id AND t.role = ir.role)",
-    ]
+    clauses = ["p.active = 1"]
+    if not include_trashed:
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM trash_entries t WHERE t.entity_type = 'person' "
+            "AND t.entity_id = p.id AND t.role = ir.role)"
+        )
     params: list[Any] = []
     if content_type:
         clauses.append("ir.content_type = ?")

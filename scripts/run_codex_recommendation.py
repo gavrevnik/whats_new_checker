@@ -9,14 +9,6 @@ from pathlib import Path
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
 
-BASE_INSTRUCTIONS = """You are a personal movie recommendation assistant.
-Follow the supplied Russian-language task exactly. Do not inspect files, execute shell commands,
-modify anything, or ask follow-up questions. Use only the context included in the prompt and your
-knowledge. Return only JSON that strictly matches the supplied output schema. Do not wrap it in
-Markdown, add prose outside the JSON, or change the field names.
-"""
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run an isolated Codex movie recommendation turn")
     parser.add_argument("--model", required=True)
@@ -35,19 +27,14 @@ def main() -> None:
         with Codex(config) as codex:
             thread = codex.thread_start(
                 approval_mode=ApprovalMode.deny_all,
-                base_instructions=(
-                    f"{BASE_INSTRUCTIONS}\n\n"
-                    "The following recommendation contract is mandatory system-level context. "
-                    "Apply every enabled filter before choosing movies:\n\n"
-                    f"{recommendation_instructions}"
-                ),
+                base_instructions=recommendation_instructions,
                 cwd=directory,
                 ephemeral=True,
                 model=args.model,
                 sandbox=Sandbox.read_only,
             )
             result = thread.run(
-                "Выполни заданный в системных инструкциях контракт рекомендации фильмов.",
+                "Выполни заданный в системных инструкциях контракт рекомендаций.",
                 sandbox=Sandbox.read_only,
                 output_schema=output_schema,
             )

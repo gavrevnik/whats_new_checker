@@ -44,7 +44,7 @@ class MusicBrainzTests(unittest.TestCase):
             "media":[{"format":"CD","track-count":8,"tracks":[{"number":"1","title":"Wall of Eyes","length":305000}]}],
         }
         with patch.object(musicbrainz, "_request_json", side_effect=[group, release]) as request, \
-             patch.object(musicbrainz, "_cover_art_url", return_value="https://coverartarchive.org/release-group/rg-1/front-500"), \
+             patch.object(musicbrainz, "_cover_art_url", return_value="https://coverartarchive.org/release-group/rg-1/front-250"), \
              patch.object(musicbrainz.listenbrainz, "enrich_albums", side_effect=lambda items: items):
             item = musicbrainz.album_details("rg-1")
         self.assertEqual(request.call_count, 2)
@@ -53,7 +53,7 @@ class MusicBrainzTests(unittest.TestCase):
         self.assertEqual(item["label"], "XL Recordings")
         self.assertEqual(item["genres_data"][0]["name"], "art rock")
         self.assertEqual(item["details_json"]["track_list"][0]["title"], "Wall of Eyes")
-        self.assertEqual(item["cover_url"], "https://coverartarchive.org/release-group/rg-1/front-500")
+        self.assertEqual(item["cover_url"], "https://coverartarchive.org/release-group/rg-1/front-250")
 
     def test_cover_art_returns_empty_for_missing_or_non_front_image(self) -> None:
         missing = urllib.error.HTTPError("url", 404, "Not found", None, None)
@@ -68,12 +68,12 @@ class MusicBrainzTests(unittest.TestCase):
                 return False
 
             def read(self):
-                return b'{"images":[{"front":false,"thumbnails":{"500":"image"}}]}'
+                return b'{"images":[{"front":false,"thumbnails":{"250":"image"}}]}'
 
         with patch.object(musicbrainz.urllib.request, "urlopen", return_value=Response()):
             self.assertEqual(musicbrainz._cover_art_url("rg-1"), "")
 
-    def test_cover_art_uses_validated_release_group_front_500_url(self) -> None:
+    def test_cover_art_uses_validated_release_group_front_250_url(self) -> None:
         class Response:
             def __init__(self, body=b""):
                 self.body = body
@@ -87,10 +87,10 @@ class MusicBrainzTests(unittest.TestCase):
             def read(self):
                 return self.body
 
-        metadata = Response(b'{"images":[{"front":true,"thumbnails":{"500":"image"}}]}')
+        metadata = Response(b'{"images":[{"front":true,"thumbnails":{"250":"image"}}]}')
         with patch.object(musicbrainz.urllib.request, "urlopen", side_effect=[metadata, Response()]) as request:
             url = musicbrainz._cover_art_url("rg-1")
-        self.assertEqual(url, "https://coverartarchive.org/release-group/rg-1/front-500")
+        self.assertEqual(url, "https://coverartarchive.org/release-group/rg-1/front-250")
         self.assertEqual(request.call_count, 2)
         self.assertEqual(request.call_args_list[1].args[0].get_method(), "HEAD")
 
@@ -191,6 +191,7 @@ class MusicBrainzTests(unittest.TestCase):
         artist = storage.add_music_artist({"content_type":"music","name":"Artist","mbid":"artist-1"})
         candidates = [
             {"release_group_mbid":"studio","title_original":"Studio","year":2026,"secondary_types":[]},
+            {"release_group_mbid":"deluxe","title_original":"Studio Deluxe Edition","year":2026,"secondary_types":[]},
             {"release_group_mbid":"soundtrack","title_original":"Score","year":2026,"secondary_types":["Soundtrack"]},
             {"release_group_mbid":"dj-mix","title_original":"DJ mix","year":2026,"secondary_types":["DJ-mix"]},
         ]
@@ -199,9 +200,15 @@ class MusicBrainzTests(unittest.TestCase):
              patch.object(musicbrainz.listenbrainz, "enrich_albums", side_effect=lambda items, **_kwargs: items) as popularity:
             result = musicbrainz.recommend_albums({
                 "artist_ids":[artist["id"]], "excluded_types":["Soundtrack","DJ-mix"], "limit":10,
+                "excluded_title_terms":["Deluxe"],
                 "progress_id":"recommend-stages",
             })
         self.assertEqual([item["release_group_mbid"] for item in result["items"]], ["studio"])
+        self.assertEqual(
+            {record["item"]["release_group_mbid"] for record in result["filtered_items"]},
+            {"deluxe", "soundtrack", "dj-mix"},
+        )
+        self.assertTrue(all(record["reason"] for record in result["filtered_items"]))
         self.assertEqual(browse.call_args.args[1:3], (1900, date.today().year + 2))
         self.assertEqual(popularity.call_args.args[0], result["items"])
         self.assertTrue(popularity.call_args.kwargs["continue_on_error"])
@@ -211,6 +218,23 @@ class MusicBrainzTests(unittest.TestCase):
             [stage["id"] for stage in progress["stages"]],
             ["musicbrainz-artists","musicbrainz-details","cover-art","listenbrainz"],
         )
+
+    def test_existing_album_is_not_returned_as_filtered(self) -> None:
+        artist = storage.add_music_artist({"content_type":"music","name":"Artist","mbid":"artist-1"})
+        storage.add_item({
+            "content_type":"music", "title_original":"Existing", "title_ru":"Existing",
+            "artists":"Artist", "year":2026, "release_group_mbid":"existing", "status":"backlog",
+        })
+        candidates = [{
+            "release_group_mbid":"existing", "title_original":"Existing", "year":2026,
+            "primary_type":"Album", "secondary_types":[],
+        }]
+        with patch.object(musicbrainz, "browse_artist_albums", return_value=candidates), \
+             patch.object(musicbrainz, "album_details") as details:
+            result = musicbrainz.recommend_albums({"artist_ids":[artist["id"]], "limit":10})
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["filtered_items"], [])
+        details.assert_not_called()
 
 
 if __name__ == "__main__":

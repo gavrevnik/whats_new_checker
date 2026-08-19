@@ -53,6 +53,6 @@ fi
 if /usr/bin/curl -fsS --max-time 1 "${HEALTH_URL}" >/dev/null 2>&1; then
   /usr/bin/open "${URL}"
 else
-  /usr/bin/osascript -e 'display alert "Что дальше?" message "Не удалось запустить локальный сервер. Подробности: .runtime/server.log" as critical'
+  /usr/bin/osascript -e 'display alert "whatsNew" message "Не удалось запустить локальный сервер. Подробности: .runtime/server.log" as critical'
   exit 1
 fi

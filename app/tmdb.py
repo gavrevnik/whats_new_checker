@@ -164,26 +164,54 @@ def _get_omdb(imdb_id: str) -> dict[str, Any]:
 
 
 def _get_kinopoisk(imdb_id: str, title_original: str, title_ru: str, year: Any) -> dict[str, Any]:
-    """Resolve a movie and its Kinopoisk rating with one provider request."""
+    """Resolve a movie by IMDb ID, falling back to a normalized title search."""
     api_key, _ = get_kinopoisk_key()
     if not api_key:
         return {}
     target_year = int(year) if str(year).isdigit() else None
-    query = title_ru or title_original
-    if query:
-        params = {"keyword": query, "type": "FILM"}
-        if target_year is not None:
-            params.update({"yearFrom": max(1000, target_year - 1), "yearTo": target_year + 1})
-    elif imdb_id:
-        params = {"imdbId": imdb_id}
-    else:
-        return {}
-    try:
-        payload = _request_json(
-            f"{KINOPOISK_URL}?{urllib.parse.urlencode(params)}",
-            {"X-API-KEY": api_key},
-        )
-    except TmdbError as error:
+    request_errors: list[TmdbError] = []
+
+    def fetch(params: dict[str, Any]) -> list[dict[str, Any]]:
+        try:
+            payload = _request_json(
+                f"{KINOPOISK_URL}?{urllib.parse.urlencode(params)}",
+                {"X-API-KEY": api_key},
+            )
+        except TmdbError as error:
+            request_errors.append(error)
+            return []
+        items = payload.get("items", [])
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+    candidates: list[dict[str, Any]] = []
+    if imdb_id:
+        imdb_items = fetch({"imdbId": imdb_id})
+        candidates = [item for item in imdb_items if str(item.get("imdbId") or "") == imdb_id]
+
+    if not candidates:
+        query = (title_ru or title_original).translate(str.maketrans({"ё": "е", "Ё": "Е"}))
+        if query:
+            params: dict[str, Any] = {"keyword": query, "type": "FILM"}
+            if target_year is not None:
+                params.update({"yearFrom": max(1000, target_year - 1), "yearTo": target_year + 1})
+            title_items = fetch(params)
+            wanted = {_normalized(title_original), _normalized(title_ru)} - {""}
+            for item in title_items:
+                names = {
+                    _normalized(str(item.get("nameOriginal") or "")),
+                    _normalized(str(item.get("nameEn") or "")),
+                    _normalized(str(item.get("nameRu") or "")),
+                } - {""}
+                candidate_year = item.get("year")
+                year_matches = (
+                    target_year is None
+                    or str(candidate_year).isdigit() and abs(int(candidate_year) - target_year) <= 1
+                )
+                if wanted & names and year_matches:
+                    candidates.append(item)
+
+    if not candidates and request_errors:
+        error = request_errors[-1]
         # This companion provider must not make an otherwise valid TMDB refresh fail.
         is_limit = "HTTP 402" in str(error) or "HTTP 429" in str(error)
         message = (
@@ -198,26 +226,6 @@ def _get_kinopoisk(imdb_id: str, title_original: str, title_ru: str, year: Any) 
                 "message": message,
             }],
         }
-    items = payload.get("items", [])
-    if not isinstance(items, list):
-        return {}
-    imdb_candidates = [item for item in items if imdb_id and str(item.get("imdbId") or "") == imdb_id]
-    wanted = {_normalized(title_original), _normalized(title_ru)} - {""}
-    title_candidates = []
-    for item in items:
-        names = {
-            _normalized(str(item.get("nameOriginal") or "")),
-            _normalized(str(item.get("nameEn") or "")),
-            _normalized(str(item.get("nameRu") or "")),
-        } - {""}
-        candidate_year = item.get("year")
-        year_matches = (
-            target_year is None
-            or str(candidate_year).isdigit() and abs(int(candidate_year) - target_year) <= 1
-        )
-        if wanted & names and year_matches:
-            title_candidates.append(item)
-    candidates = imdb_candidates or title_candidates
     if not candidates:
         return {}
     candidate = max(candidates, key=lambda item: float(item.get("ratingKinopoisk") or 0))
@@ -737,7 +745,40 @@ def refresh_movie(item_id: str) -> dict[str, Any]:
     return _refresh_movie_target(target)
 
 
-def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
+def _recommendation_movie_payload(row: dict[str, Any]) -> dict[str, Any]:
+    title_ru = str(row.get("title") or row.get("title_ru") or row.get("original_title") or "Без названия")
+    title_original = str(row.get("original_title") or row.get("title_original") or title_ru)
+    release_date = str(row.get("release_date") or "")
+    poster_path = str(row.get("poster_path") or "")
+    return {
+        "content_type": "movie",
+        "title_ru": title_ru,
+        "title_original": title_original,
+        "tmdb_id": row.get("id") or row.get("tmdb_id"),
+        "release_date": release_date,
+        "year": release_date[:4] if release_date[:4].isdigit() else row.get("year"),
+        "overview": str(row.get("overview") or ""),
+        "original_language": str(row.get("original_language") or ""),
+        "tmdb_rating": row.get("vote_average"),
+        "tmdb_vote_count": row.get("vote_count"),
+        "poster_path": poster_path,
+        "poster_url": f"https://image.tmdb.org/t/p/w185{poster_path}" if poster_path else "",
+        "source": "tmdb",
+        "raw_data": row,
+    }
+
+
+def _known_recommendation_movie(row: dict[str, Any], known_ids: set[str], known_titles: set[str]) -> bool:
+    movie_id = str(row.get("id") or row.get("tmdb_id") or "")
+    year = str(row.get("release_date") or row.get("year") or "")[:4]
+    keys = {
+        _normalized(str(row.get("original_title") or row.get("title_original") or "")),
+        _normalized(str(row.get("title") or row.get("title_ru") or "")),
+    } - {""}
+    return movie_id in known_ids or any(key in known_titles or f"{key}:{year}" in known_titles for key in keys)
+
+
+def recommend_movies(filters: dict[str, Any]) -> dict[str, Any]:
     api_key, _ = get_api_key()
     if not api_key:
         raise TmdbError("TMDB_API_KEY is not configured")
@@ -770,7 +811,9 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
     limit = min(max(int(filters.get("limit", 20) or 20), 1), 50)
     excluded_genre_ids, excluded_genres = _excluded_genre_filters(filters.get("excluded_genres", []))
 
+    known_ids, known_titles = storage.known_movie_keys()
     candidates: dict[int, dict[str, Any]] = {}
+    filtered_candidates: dict[int, dict[str, Any]] = {}
     for person in interests:
         try:
             credits = _get(f"/person/{person['external_id']}/movie_credits", {"language": "ru-RU"}, api_key)
@@ -780,18 +823,26 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
             for row in source_rows:
                 movie_id = row.get("id")
                 release_date = str(row.get("release_date") or "")
-                if not movie_id or not (date_from <= release_date <= date_to):
+                if not movie_id or _known_recommendation_movie(row, known_ids, known_titles):
                     continue
+                reasons: list[str] = []
+                if not release_date or not (date_from <= release_date <= date_to):
+                    reasons.append(f"дата выхода вне диапазона {date_from[:4]}–{date_to[:4]} или недоступна")
                 if excluded_genre_ids & {int(value) for value in row.get("genre_ids", []) if str(value).isdigit()}:
-                    continue
-                if int(row.get("vote_count") or 0) < min_votes:
+                    reasons.append("исключённый жанр")
+                vote_count = int(row.get("vote_count") or 0)
+                if vote_count < min_votes:
+                    reasons.append(f"голосов TMDB меньше {min_votes}")
+                if reasons:
+                    filtered_candidates.setdefault(int(movie_id), {
+                        "item": _recommendation_movie_payload(row), "reason": "; ".join(reasons),
+                    })
                     continue
                 candidates.setdefault(int(movie_id), row)
         finally:
             recommendation_progress.advance(progress_id, "tmdb-people")
     recommendation_progress.finish_stage(progress_id, "tmdb-people")
 
-    known_ids, known_titles = storage.known_movie_keys()
     ranked = sorted(
         candidates.values(),
         key=lambda row: (float(row.get("vote_average") or 0), int(row.get("vote_count") or 0)),
@@ -803,6 +854,7 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
     )
 
     results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
     try:
         for row in ranked:
             try:
@@ -823,10 +875,15 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
                         recommendation_progress.add_warning(
                             progress_id, str(warning.get("provider") or "API"), str(warning["message"])
                         )
-                if int(details.get("duration_minutes") or 0) < min_runtime:
+                if _known_recommendation_movie(details, known_ids, known_titles):
                     continue
-                if min_imdb_rating and float(details.get("imdb_rating") or 0) < min_imdb_rating:
-                    continue
+                reasons: list[str] = []
+                runtime = int(details.get("duration_minutes") or 0)
+                if runtime < min_runtime:
+                    reasons.append(f"длительность меньше {min_runtime} мин. или недоступна")
+                imdb_rating = float(details.get("imdb_rating") or 0)
+                if min_imdb_rating and imdb_rating < min_imdb_rating:
+                    reasons.append(f"IMDb rating ниже {min_imdb_rating:g} или недоступен")
                 if min_kinopoisk_rating:
                     rating = details.get("kinopoisk_rating")
                     kinopoisk_failed = any(
@@ -835,20 +892,27 @@ def recommend_movies(filters: dict[str, Any]) -> list[dict[str, Any]]:
                         if isinstance(warning, dict)
                     )
                     if rating in (None, "") and not kinopoisk_failed:
-                        continue
-                    if rating not in (None, "") and float(rating) < min_kinopoisk_rating:
-                        continue
+                        reasons.append("рейтинг Кинопоиска недоступен")
+                    elif rating not in (None, "") and float(rating) < min_kinopoisk_rating:
+                        reasons.append(f"рейтинг Кинопоиска ниже {min_kinopoisk_rating:g}")
                 if excluded_genres & {_normalized(genre) for genre in details.get("genres", "").split(";")}:
+                    reasons.append("исключённый жанр")
+                if reasons:
+                    filtered_candidates[int(movie_id)] = {"item": details, "reason": "; ".join(reasons)}
                     continue
                 results.append(details)
                 if len(results) >= limit:
                     break
             except Exception as error:
+                reason = str(error)
+                errors.append({"title": str(row.get("title") or row.get("original_title") or "Фильм"), "error": reason})
+                filtered_candidates[int(row["id"])] = {
+                    "item": _recommendation_movie_payload(row), "reason": reason,
+                }
                 recommendation_progress.add_warning(progress_id, "TMDB", str(error))
-                raise
             finally:
                 recommendation_progress.advance(progress_id, "movie-details")
     finally:
         recommendation_progress.finish_stage(progress_id, "movie-details")
         recommendation_progress.finish(progress_id)
-    return results
+    return {"items": results, "filtered_items": list(filtered_candidates.values()), "errors": errors}
