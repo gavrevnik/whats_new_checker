@@ -15,6 +15,7 @@ USER_AGENT = "whats-new-checker/2.1 (gavrevns@gmail.com)"
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 ALBUM_COVER_SIZE = 250
 MOVIE_POSTER_SIZE = "w185"
+PERSON_PROFILE_SIZE = "w185"
 
 
 class ArtworkError(RuntimeError):
@@ -37,6 +38,17 @@ def movie_poster_url(poster_path: str) -> str:
     return f"https://image.tmdb.org/t/p/{MOVIE_POSTER_SIZE}/{path.lstrip('/')}"
 
 
+def person_profile_url(profile_path: str) -> str:
+    path = str(profile_path or "").strip()
+    if not path:
+        return ""
+    if path.startswith("http://") or path.startswith("https://"):
+        if "image.tmdb.org/t/p/" in path:
+            return re.sub(r"(/t/p/)[^/]+/", rf"\g<1>{PERSON_PROFILE_SIZE}/", path, count=1)
+        return path
+    return f"https://image.tmdb.org/t/p/{PERSON_PROFILE_SIZE}/{path.lstrip('/')}"
+
+
 def preferred_album_cover_url(release_group_mbid: str, cover_url: str = "") -> str:
     url = str(cover_url or "").strip()
     if "coverartarchive.org/release-group/" in url:
@@ -52,7 +64,9 @@ def _safe_identifier(value: object) -> str:
 
 
 def _relative_path(kind: str, identifier: object) -> str:
-    folder = "albums" if kind == "album" else "movies"
+    folder = {"album": "albums", "movie": "movies", "person": "people"}.get(kind)
+    if not folder:
+        raise ArtworkError("Неизвестный тип изображения")
     return f"{folder}/{_safe_identifier(identifier)}.jpg"
 
 
@@ -138,6 +152,16 @@ def cache_movie_poster(
     if destination.is_file() and not force:
         return relative
     return relative if _download(movie_poster_url(poster_url or poster_path), destination) else ""
+
+
+def cache_person_profile(
+    tmdb_id: object, profile_path: str = "", profile_url: str = "", *, force: bool = False,
+) -> str:
+    relative = _relative_path("person", tmdb_id)
+    destination = resolve_local_path(relative)
+    if destination.is_file() and not force:
+        return relative
+    return relative if _download(person_profile_url(profile_url or profile_path), destination) else ""
 
 
 def content_type(relative_path: str) -> str:

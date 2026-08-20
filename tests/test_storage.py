@@ -37,11 +37,17 @@ class StorageTests(unittest.TestCase):
         self.assertIn("Режиссёры: Кристофер Нолан (Christopher Nolan)", created["key_people"])
         self.assertEqual(created["genres"], "Фантастика")
         self.assertEqual(json.loads(created["awards_json"])[0]["summary"], "4 Oscars")
+        self.assertFalse(created["planned_soon"])
+        planned = storage.update_item(created["id"], {"planned_soon":True})
+        self.assertTrue(planned["planned_soon"])
         updated = storage.update_item(created["id"], {"status":"consumed","reaction":"like"})
         self.assertEqual(updated["reaction"], "like")
+        self.assertFalse(updated["planned_soon"])
         self.assertTrue(updated["consumed_at"])
         reset = storage.update_item(created["id"], {"reaction":""})
         self.assertEqual(reset["reaction"], "")
+        noted = storage.update_item(created["id"], {"notes":"Пересмотреть режиссёрскую версию"})
+        self.assertEqual(noted["notes"], "Пересмотреть режиссёрскую версию")
 
     def test_return_to_backlog_clears_reaction(self) -> None:
         created = storage.add_item({"content_type":"movie","title_original":"Memento","title_ru":"Помни","status":"consumed","reaction":"dislike"})
@@ -63,7 +69,10 @@ class StorageTests(unittest.TestCase):
         self.assertTrue({"content_items","movies","albums","music_artists","album_artists","people","interest_roles","movie_people","genres","content_aliases","trash_entries","favorite_movies"} <= tables)
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertIn("raw_json", {row[1] for row in connection.execute("PRAGMA table_info(content_items)")})
+            self.assertIn("planned_soon", {row[1] for row in connection.execute("PRAGMA table_info(content_items)")})
             self.assertIn("raw_json", {row[1] for row in connection.execute("PRAGMA table_info(people)")})
+            people_columns = {row[1] for row in connection.execute("PRAGMA table_info(people)")}
+            self.assertTrue({"profile_path", "profile_url", "profile_local_path"} <= people_columns)
             movie_columns = {row[1] for row in connection.execute("PRAGMA table_info(movies)")}
             self.assertIn("kinopoisk_id", movie_columns)
             self.assertIn("kinopoisk_rating", movie_columns)
@@ -99,8 +108,10 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(created["musicbrainz_link"], "https://musicbrainz.org/release-group/album-mbid")
         self.assertEqual(created["cover_url"], "https://coverartarchive.org/release-group/album-mbid/front-500")
         self.assertEqual(created["total_listen_count"], 12345)
+        self.assertTrue(storage.update_item(created["id"], {"planned_soon":True})["planned_soon"])
         liked = storage.update_item(created["id"], {"status":"consumed", "reaction":"like"})
         self.assertEqual(liked["reaction"], "like")
+        self.assertFalse(liked["planned_soon"])
         trashed = storage.trash_entity({"entity_type":"album", "entity_id":created["id"]})
         self.assertEqual(storage.list_library(content_type="music"), [])
         storage.restore_trash(trashed["id"])
@@ -154,11 +165,34 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(removed["favorite"])
         self.assertEqual(removed["status"], "backlog")
 
+    def test_album_can_be_added_to_favorites(self) -> None:
+        created = storage.add_item({
+            "content_type":"music", "title_original":"Favorite Album", "title_ru":"Favorite Album",
+            "artists":"Test Artist", "year":2026, "release_group_mbid":"favorite-album",
+            "status":"consumed", "reaction":"like",
+        })
+        favorite = storage.set_favorite(created["id"], True)
+        self.assertTrue(favorite["favorite"])
+        self.assertEqual(favorite["content_type"], "music")
+        listed = storage.list_library(content_type="music")
+        self.assertTrue(next(item for item in listed if item["id"] == created["id"])["favorite"])
+        self.assertFalse(storage.set_favorite(created["id"], False)["favorite"])
+
+    def test_artist_refresh_targets_include_only_artists_without_musicbrainz_id(self) -> None:
+        storage.add_music_artist({"name":"Known Artist", "mbid":"known-artist"})
+        missing = storage.add_music_artist({"name":"Unknown Artist"})
+        targets = storage.artist_refresh_targets()
+        self.assertEqual([target["id"] for target in targets], [missing["id"]])
+
     def test_people_can_be_added_and_refreshed(self) -> None:
         created = storage.add_interest_person({
             "role":"actor", "name_original":"Jack Nicholson", "name_ru":"Джек Николсон", "tmdb_id":514,
+            "profile_path":"/jack.jpg", "profile_url":"https://image.tmdb.org/t/p/w185/jack.jpg",
+            "profile_local_path":"people/514.jpg", "details_json":{"birthday":"1937-04-22"},
         })
         self.assertEqual(created["tmdb_id"], 514)
+        self.assertEqual(created["profile_local_path"], "people/514.jpg")
+        self.assertIn("1937-04-22", created["details_json"])
         updated = storage.update_interest_person(created["id"], {
             "tmdb_id":514, "name_original":"Jack Nicholson", "name_ru":"Джек Николсон",
             "details_json":{"birthday":"1937-04-22"},

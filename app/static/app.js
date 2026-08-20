@@ -1,4 +1,6 @@
-const state = { items: [], interests: [], trash: [], view: "backlog", contentType: "movie", backlogRecommendMode: "llm", query: "", apiItems: [], apiFilteredItems: [], llmItems: [], llmFilteredItems: [], llmErrors: [], peopleRecommendationItems: [], peopleRecommendationErrors: [], apiProgressWarnings: [], recommendationSort: {key:"year",direction:"desc"}, tmdb: {}, musicbrainz: {}, llm: {}, llmContextSeed: "", sortKey: "release_date", sortDirection: "desc", peopleSort: {director:{key:"name_ru",direction:"asc"},actor:{key:"name_ru",direction:"asc"},artist:{key:"name_original",direction:"asc"}}, currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingAlbumDetails: null, pendingPersonDetails: null, pendingArtistDetails: null, pendingMovieRaw: null, pendingAlbumRaw: null, pendingPersonRaw: null, pendingArtistRaw: null, pendingMovieSearchField: "", pendingAlbumSearchField: "" };
+const state = { items: [], interests: [], trash: [], view: "backlog", contentType: "movie", backlogRecommendMode: "llm", query: "", apiItems: [], apiFilteredItems: [], llmItems: [], llmFilteredItems: [], llmErrors: [], llmRawResponse: "", recommendationCancelled: false, peopleRecommendationItems: [], peopleRecommendationErrors: [], peopleRecommendationCancelled: false, apiProgressWarnings: [], recommendationSort: {key:"year",direction:"desc"}, tmdb: {}, musicbrainz: {}, llm: {}, llmContextSeed: "", sortKey: "release_date", sortDirection: "desc", peopleSort: {director:{key:"name_ru",direction:"asc"},actor:{key:"name_ru",direction:"asc"},artist:{key:"name_original",direction:"asc"}}, currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingAlbumDetails: null, pendingPersonDetails: null, pendingArtistDetails: null, pendingMovieRaw: null, pendingAlbumRaw: null, pendingPersonRaw: null, pendingArtistRaw: null, pendingMovieSearchField: "", pendingAlbumSearchField: "" };
+const activeOperations = {recommendation:"",people:"",refresh:""};
+const operationRunning = () => Object.values(activeOperations).some(Boolean);
 const $ = selector => document.querySelector(selector);
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
 
@@ -23,7 +25,22 @@ function awardsSummary(raw) {
 }
 
 function text(value) { return value === null || value === undefined || value === "" ? "—" : String(value); }
+function actionIcon(name) {
+  const thumb = `<path d="M7 10v11H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3Z"/><path d="m7 10 4-7a2 2 0 0 1 3.7 1.5L14 8h5a2 2 0 0 1 2 2.4l-1.6 8a2 2 0 0 1-2 1.6H7"/>`;
+  const paths = {
+    like: thumb,
+    dislike: `<g transform="rotate(180 12 12)">${thumb}</g>`,
+    trash: `<path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6M14 11v6"/>`,
+    calendarCheck: `<path d="M8 2v4M16 2v4M3 10h18"/><rect x="3" y="4" width="18" height="18" rx="2"/><path d="m8.5 16 2 2 5-5"/>`,
+  };
+  return `<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name] || ""}</svg>`;
+}
 function movieRatings(item) { return `${text(item.imdb_rating)} / ${text(item.kinopoisk_rating)}`; }
+function plannedSoonButton(item) {
+  const active = Boolean(item.planned_soon);
+  const label = active ? "Убрать из ближайших планов" : "Запланировать на ближайшее время";
+  return `<button type="button" class="icon-button outline-action-button planned-soon-button${active ? " active" : ""}" data-planned-soon-toggle data-id="${escapeHtml(item.id)}" title="${label}" aria-label="${label}" aria-pressed="${active}">${actionIcon("calendarCheck")}</button>`;
+}
 function providerWarningText(warning) {
   const labels = {"cover-art-archive":"Cover Art Archive",listenbrainz:"ListenBrainz",musicbrainz:"MusicBrainz",kinopoisk:"Кинопоиск","tmdb-images":"TMDB Images",tmdb:"TMDB"};
   const label = labels[String(warning?.provider || "").toLowerCase()] || warning?.provider || "API", message = String(warning?.message || "");
@@ -121,6 +138,12 @@ function moviePosterHtml(item, className = "movie-poster") {
   const url = available && (artworkItemUrl(item,"movie") || localArtworkUrl(item?.poster_local_path) || validUrl(item?.poster_url));
   return url ? `<img class="${className}" src="${escapeHtml(url)}" alt="Постер ${escapeHtml(title(item))}" loading="lazy" data-artwork>` : `<span class="movie-poster-placeholder" aria-hidden="true"></span>`;
 }
+function personPhotoHtml(item, className = "person-photo") {
+  const available = item?.profile_local_path || item?.profile_path || validUrl(item?.profile_url);
+  const storedUrl = item?.id && available ? `/api/artwork/person/${encodeURIComponent(item.id)}` : "";
+  const url = available && (storedUrl || localArtworkUrl(item?.profile_local_path) || validUrl(item?.profile_url));
+  return url ? `<img class="${className}" src="${escapeHtml(url)}" alt="Фото ${escapeHtml(titlePerson(item))}" loading="lazy" data-artwork>` : `<span class="person-photo-placeholder ${className === "detail-person-photo" ? "detail-person-photo" : ""}" aria-hidden="true"></span>`;
+}
 function albumTypes(item) {
   let secondary = item.secondary_types || item.secondary_types_json || [];
   if (typeof secondary === "string") { try { secondary = JSON.parse(secondary); } catch { secondary = []; } }
@@ -157,12 +180,21 @@ function filtered(items) {
   const query = state.query.trim().toLocaleLowerCase("ru");
   if (!query) return items;
   return items.filter(item => [
-    item.title_ru, item.title_original, item.directors, item.artists, item.genres,
+    item.title_ru, item.title_original, item.directors, item.artists, item.genres, item.countries,
     item.key_actors, item.key_directors, item.key_people, formatKeyPeople(item),
   ].filter(Boolean).join(" ").toLocaleLowerCase("ru").includes(query));
 }
 
 function peopleList(value) { return String(value || "").split(";").map(item => item.trim()).filter(Boolean); }
+function directorsCellHtml(value) {
+  const directors = peopleList(value);
+  if (!directors.length) return "—";
+  return directors.map(name => {
+    const match = name.match(/^(.*?)\s*\(([^()]*)\)\s*$/);
+    if (!match) return `<span class="director-entry">${escapeHtml(name)}</span>`;
+    return `<span class="director-entry"><span>${escapeHtml(match[1].trim())}</span><span class="director-original">(${escapeHtml(match[2].trim())})</span></span>`;
+  }).join("");
+}
 function formatKeyPeople(item, compact = false, localizedOnly = false, hideRole = false) {
   const groups = [["Актёры", peopleList(item.key_actors)], ["Режиссёры", peopleList(item.key_directors)]];
   if (compact) {
@@ -179,7 +211,7 @@ function formatKeyPeople(item, compact = false, localizedOnly = false, hideRole 
 }
 
 function sortedBacklog(items) {
-  const numeric = new Set(["imdb_rating", "kinopoisk_rating", "total_listen_count", "track_count", "year"]);
+  const numeric = new Set(["imdb_rating", "kinopoisk_rating", "total_listen_count", "track_count", "year", "planned_soon"]);
   return [...items].sort((left, right) => {
     const a = left[state.sortKey] ?? "", b = right[state.sortKey] ?? "";
     let result;
@@ -198,21 +230,21 @@ function updateSortIndicators() {
 }
 
 function movieRow(item) {
-  const action = `<button class="mini-button like reaction-button" data-item-action="like" data-id="${escapeHtml(item.id)}" title="Понравилось" aria-label="Понравилось">+</button><button class="mini-button dislike reaction-button" data-item-action="dislike" data-id="${escapeHtml(item.id)}" title="Не понравилось" aria-label="Не понравилось">−</button><button class="icon-button trash-button" data-trash-entity="movie" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить фильм в корзину">🗑</button>`;
+  const action = `<button type="button" class="mini-button like reaction-button outline-action-button" data-item-action="like" data-id="${escapeHtml(item.id)}" title="Понравилось" aria-label="Понравилось">${actionIcon("like")}</button><button type="button" class="mini-button dislike reaction-button outline-action-button" data-item-action="dislike" data-id="${escapeHtml(item.id)}" title="Не понравилось" aria-label="Не понравилось">${actionIcon("dislike")}</button><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="movie" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить фильм в корзину">${actionIcon("trash")}</button>`;
   const titleCell = `<button class="movie-title-button" data-details-id="${escapeHtml(item.id)}"><strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span></button><div class="movie-title-links">${backlogMovieLinksHtml(item)}</div>`;
   return `<tr>
-    <td class="movie-poster-cell">${moviePosterHtml(item)}</td><td class="movie-title">${titleCell}</td>
-    <td>${escapeHtml(text(item.release_date || item.year))}</td><td>${escapeHtml(text(item.directors))}</td>
-    <td>${escapeHtml(movieRatings(item))}</td><td>${escapeHtml(text(item.countries))}</td>
-    <td class="cell-people">${escapeHtml(text(formatKeyPeople(item, true, true, true)))}</td>
+    <td class="movie-poster-cell">${moviePosterHtml(item)}</td><td class="movie-title backlog-title-cell">${titleCell}</td>
+    <td class="backlog-release-cell">${escapeHtml(text(item.release_date || item.year))}</td><td class="backlog-director-cell">${directorsCellHtml(item.directors)}</td>
+    <td>${escapeHtml(movieRatings(item))}</td><td class="cell-people">${escapeHtml(text(formatKeyPeople(item, true, true, true)))}</td>
+    <td class="countries-cell">${escapeHtml(text(item.countries))}</td><td class="planned-soon-cell">${plannedSoonButton(item)}</td>
     <td><div class="table-actions">${action}</div></td>
   </tr>`;
 }
 
 function albumRow(item) {
-  const action = `<button class="mini-button like reaction-button" data-item-action="like" data-id="${escapeHtml(item.id)}" title="Понравилось" aria-label="Понравилось">+</button><button class="mini-button dislike reaction-button" data-item-action="dislike" data-id="${escapeHtml(item.id)}" title="Не понравилось" aria-label="Не понравилось">−</button><button class="icon-button trash-button" data-trash-entity="album" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить альбом в корзину">🗑</button>`;
+  const action = `<button type="button" class="mini-button like reaction-button outline-action-button" data-item-action="like" data-id="${escapeHtml(item.id)}" title="Понравилось" aria-label="Понравилось">${actionIcon("like")}</button><button type="button" class="mini-button dislike reaction-button outline-action-button" data-item-action="dislike" data-id="${escapeHtml(item.id)}" title="Не понравилось" aria-label="Не понравилось">${actionIcon("dislike")}</button><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="album" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить альбом в корзину">${actionIcon("trash")}</button>`;
   const titleCell = `<button class="movie-title-button" data-details-id="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title_original || title(item))}</strong><span>${escapeHtml(text(item.artists))}</span></button>`;
-  return `<tr><td class="album-cover-cell">${albumCoverHtml(item)}</td><td class="movie-title">${titleCell}</td><td>${escapeHtml(text(item.artists))}</td><td>${escapeHtml(text(item.first_release_date || item.year))}</td><td>${escapeHtml(text(item.track_count))}</td><td>${escapeHtml(listenCount(item))}</td><td class="cell-links"><a class="external-link" href="${escapeHtml(youtubeMusicAlbumUrl(item))}" target="_blank" rel="noreferrer">YouTube Music ↗</a></td><td><div class="table-actions">${action}</div></td></tr>`;
+  return `<tr><td class="album-cover-cell">${albumCoverHtml(item)}</td><td class="movie-title">${titleCell}</td><td>${escapeHtml(text(item.artists))}</td><td>${escapeHtml(text(item.first_release_date || item.year))}</td><td>${escapeHtml(text(item.track_count))}</td><td>${escapeHtml(listenCount(item))}</td><td class="cell-links"><a class="external-link" href="${escapeHtml(youtubeMusicAlbumUrl(item))}" target="_blank" rel="noreferrer">YouTube Music ↗</a></td><td class="planned-soon-cell">${plannedSoonButton(item)}</td><td><div class="table-actions">${action}</div></td></tr>`;
 }
 
 function recommendationMovieRow(item, index, filtered = false) {
@@ -298,10 +330,11 @@ function renderFilteredRecommendations() {
 }
 
 function renderLlmRecommendations() {
+  $("#open-llm-raw-response").classList.toggle("hidden", !state.llmRawResponse);
   $("#backlog-recommend-body").innerHTML = state.llmItems.length
     ? sortedRecommendationEntries(state.llmItems).map(({item,index}) => (state.contentType === "music" ? recommendationAlbumRow : recommendationMovieRow)(item,index)).join("")
     : `<tr><td colspan="11" class="empty">Подходящих новых ${state.contentType === "music" ? "альбомов" : "фильмов"} не найдено</td></tr>`;
-  $("#backlog-recommend-message").textContent = `Уточнено ${state.contentType === "music" ? "альбомов" : "фильмов"}: ${state.llmItems.length}. Не прошли фильтрацию: ${state.llmFilteredItems.length}.`;
+  $("#backlog-recommend-message").textContent = `${state.recommendationCancelled ? "Остановлено. " : ""}Уточнено ${state.contentType === "music" ? "альбомов" : "фильмов"}: ${state.llmItems.length}. Не прошли фильтрацию: ${state.llmFilteredItems.length}.`;
   $("#backlog-recommend-message").classList.remove("error");
   renderFilteredRecommendations();
   updateRecommendationSortIndicators();
@@ -309,10 +342,11 @@ function renderLlmRecommendations() {
 }
 
 function renderApiRecommendations() {
+  $("#open-llm-raw-response").classList.add("hidden");
   $("#backlog-recommend-body").innerHTML = state.apiItems.length
     ? sortedRecommendationEntries(state.apiItems).map(({item,index}) => (state.contentType === "music" ? recommendationAlbumRow : recommendationMovieRow)(item,index)).join("")
     : `<tr><td colspan="10" class="empty">Новых ${state.contentType === "music" ? "альбомов" : "фильмов"} по выбранным условиям нет</td></tr>`;
-  $("#backlog-recommend-message").textContent = `Найдено новых ${state.contentType === "music" ? "альбомов" : "фильмов"}: ${state.apiItems.length}. Не прошли фильтрацию: ${state.apiFilteredItems.length}.`;
+  $("#backlog-recommend-message").textContent = `${state.recommendationCancelled ? "Остановлено. " : ""}Найдено новых ${state.contentType === "music" ? "альбомов" : "фильмов"}: ${state.apiItems.length}. Не прошли фильтрацию: ${state.apiFilteredItems.length}.`;
   $("#backlog-recommend-message").classList.remove("error");
   renderFilteredRecommendations();
   updateRecommendationSortIndicators();
@@ -330,28 +364,30 @@ function ratedCard(item) {
   return `<article class="rated-card" data-card-id="${escapeHtml(item.id)}" tabindex="0">
     <div class="rated-card-main"><div><h3>${escapeHtml(title(item))}</h3><span class="rated-original">${escapeHtml(item.title_original)}</span><p>${escapeHtml(subtitle)}</p></div>${state.contentType === "music" ? albumCoverHtml(item,"rated-card-cover") : moviePosterHtml(item,"rated-card-poster")}</div>
     <div class="rated-actions">
-      <button class="mini-button like reaction-button" data-reaction-toggle="like" data-id="${escapeHtml(item.id)}" title="${reaction === "like" ? "Убрать отметку «Понравилось»" : "Понравилось"}" aria-label="${reaction === "like" ? "Убрать отметку «Понравилось»" : "Понравилось"}">+</button>
-      <button class="mini-button dislike reaction-button" data-reaction-toggle="dislike" data-id="${escapeHtml(item.id)}" title="${reaction === "dislike" ? "Убрать отметку «Не понравилось»" : "Не понравилось"}" aria-label="${reaction === "dislike" ? "Убрать отметку «Не понравилось»" : "Не понравилось"}">−</button>
+      <button type="button" class="mini-button like reaction-button outline-action-button${reaction === "like" ? " active" : ""}" data-reaction-toggle="like" data-id="${escapeHtml(item.id)}" title="${reaction === "like" ? "Убрать отметку «Понравилось»" : "Понравилось"}" aria-label="${reaction === "like" ? "Убрать отметку «Понравилось»" : "Понравилось"}" aria-pressed="${reaction === "like"}">${actionIcon("like")}</button>
+      <button type="button" class="mini-button dislike reaction-button outline-action-button${reaction === "dislike" ? " active" : ""}" data-reaction-toggle="dislike" data-id="${escapeHtml(item.id)}" title="${reaction === "dislike" ? "Убрать отметку «Не понравилось»" : "Не понравилось"}" aria-label="${reaction === "dislike" ? "Убрать отметку «Не понравилось»" : "Не понравилось"}" aria-pressed="${reaction === "dislike"}">${actionIcon("dislike")}</button>
       <button class="mini-button" data-item-action="backlog" data-id="${escapeHtml(item.id)}">В бэклог</button>
-      ${state.contentType === "movie" ? favoriteButton(item) : ""}
+      ${favoriteButton(item)}
     </div>
   </article>`;
 }
 
 function favoriteCard(item) {
+  const artwork = state.contentType === "music" ? albumCoverHtml(item,"rated-card-cover") : moviePosterHtml(item,"rated-card-poster");
+  const subtitle = state.contentType === "music" ? `${text(item.artists)} · ${text(item.year)}` : `${text(item.directors)} · ${text(item.year)}`;
   return `<article class="rated-card favorite-card" data-card-id="${escapeHtml(item.id)}" tabindex="0">
-    <div class="favorite-card-head"><div><h3>${escapeHtml(title(item))}</h3><span class="rated-original">${escapeHtml(item.title_original)}</span></div>${moviePosterHtml(item,"rated-card-poster")}${favoriteButton(item)}</div>
-    <p>${escapeHtml(text(item.directors))} · ${escapeHtml(text(item.year))}</p>
+    <div class="favorite-card-head"><div><h3>${escapeHtml(title(item))}</h3><span class="rated-original">${escapeHtml(item.title_original)}</span></div>${artwork}${favoriteButton(item)}</div>
+    <p>${escapeHtml(subtitle)}</p>
   </article>`;
 }
 
 function renderLibrary() {
   const backlog = sortedBacklog(filtered(state.items.filter(item => item.status === "backlog")));
   if (state.contentType === "music") {
-    $("#backlog-head").innerHTML = `<tr><th>Обложка</th><th><button class="sort-button" data-sort="title_ru">Название</button></th><th><button class="sort-button" data-sort="artists">Исполнитель</button></th><th><button class="sort-button" data-sort="release_date">Первый выпуск</button></th><th><button class="sort-button" data-sort="track_count">Песен</button></th><th><button class="sort-button" data-sort="total_listen_count">Прослушивания</button></th><th>Link</th><th></th></tr>`;
+    $("#backlog-head").innerHTML = `<tr><th>Обложка</th><th><button class="sort-button" data-sort="title_ru">Название</button></th><th><button class="sort-button" data-sort="artists">Исполнитель</button></th><th><button class="sort-button" data-sort="release_date">Первый выпуск</button></th><th><button class="sort-button" data-sort="track_count">Песен</button></th><th><button class="sort-button" data-sort="total_listen_count">Прослушивания</button></th><th>Link</th><th class="planned-soon-head"><button class="sort-button planned-soon-sort" data-sort="planned_soon" title="Сначала запланированные" aria-label="Сортировать: сначала запланированные">${actionIcon("calendarCheck")}</button></th><th></th></tr>`;
     $("#backlog-body").innerHTML = backlog.map(albumRow).join("");
   } else {
-    $("#backlog-head").innerHTML = `<tr><th>Постер</th><th><button class="sort-button" data-sort="title_ru">Название</button></th><th><button class="sort-button" data-sort="release_date">Дата выхода</button></th><th><button class="sort-button" data-sort="directors">Режиссёр</button></th><th><button class="sort-button" data-sort="imdb_rating">IMDb / КП</button></th><th><button class="sort-button" data-sort="countries">Страны</button></th><th><button class="sort-button" data-sort="key_people">Ключевые персоны</button></th><th></th></tr>`;
+    $("#backlog-head").innerHTML = `<tr><th>Постер</th><th class="backlog-title-head"><button class="sort-button" data-sort="title_ru">Название</button></th><th class="backlog-release-head"><button class="sort-button" data-sort="release_date">Дата выхода</button></th><th class="backlog-director-head"><button class="sort-button" data-sort="directors">Режиссёр</button></th><th><button class="sort-button" data-sort="imdb_rating">IMDb / КП</button></th><th class="key-people-head"><button class="sort-button" data-sort="key_people">Ключевые персоны</button></th><th class="countries-head"><button class="sort-button" data-sort="countries">Страны</button></th><th class="planned-soon-head"><button class="sort-button planned-soon-sort" data-sort="planned_soon" title="Сначала запланированные" aria-label="Сортировать: сначала запланированные">${actionIcon("calendarCheck")}</button></th><th></th></tr>`;
     $("#backlog-body").innerHTML = backlog.map(movieRow).join("");
   }
   $("#backlog-count").textContent = backlog.length; $("#backlog-empty").classList.toggle("hidden", backlog.length > 0); updateSortIndicators();
@@ -361,10 +397,10 @@ function renderLibrary() {
     $(`#${key}-list`).innerHTML = items.length ? items.map(ratedCard).join("") : `<div class="empty">Пусто</div>`;
     $(`#${key}-count`).textContent = items.length;
   }
-  const favorites = state.contentType === "movie" ? filtered(state.items.filter(item => item.favorite)) : [];
+  const favorites = state.items.filter(item => item.favorite);
   $("#favorites-list").innerHTML = favorites.map(favoriteCard).join("");
   $("#favorites-count").textContent = favorites.length;
-  $("#favorites-empty").textContent = state.contentType === "music" ? "Для музыки избранное пока не поддерживается." : "В избранном пока ничего нет.";
+  $("#favorites-empty").textContent = "В избранном пока ничего нет.";
   $("#favorites-empty").classList.toggle("hidden", favorites.length > 0);
 }
 
@@ -377,7 +413,7 @@ function showDetails(item) {
     $("#details-eyebrow").textContent = "Карточка альбома";
     $("#refresh-detail").textContent = "↻ Актуализировать из MusicBrainz";
     const fields = [["Исполнитель",item.artists],["Оригинальное название",item.title_original],["Первый выпуск",item.first_release_date || item.year],["Количество песен",item.track_count],["Тип",albumTypes(item)],["Жанры",item.genres],["Теги",item.tags],["Прослушивания ListenBrainz",listenCount(item)],["Страна издания",item.country],["Лейбл",item.label],["Каталожный номер",item.catalog_number],["Штрихкод",item.barcode],["Формат",item.media_formats],["Статус издания",item.release_status],["Уточнение",item.disambiguation],["Трек-лист",formatTrackList(item.track_list),true],["Аннотация",item.annotation,true],["Заметка",item.notes,true],["Raw · исходный ввод",formatRaw(item.raw_json),true]];
-    const cards = fields.map(([label,value,wide]) => `<div class="detail ${wide ? "wide" : ""}"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
+    const cards = fields.map(([label,value,wide]) => detailFieldHtml(label,value,wide,label === "Заметка" ? item.id : "")).join("");
     const cover = `<div class="detail wide"><span>Обложка</span><div class="album-detail-artwork">${albumCoverHtml(item,"detail-cover")}${youtubeMusicAlbumLinkHtml(item)}</div></div>`;
     $("#details-content").innerHTML = cover + cards;
     if (!$("#details-dialog").open) $("#details-dialog").showModal();
@@ -392,16 +428,108 @@ function showDetails(item) {
     ["Сценаристы", item.writers], ["Актёры", item.cast, true], ["Ключевые персоны", formatKeyPeople(item), true],
     ["Награды", awardsSummary(item.awards_json), true], ["Ключевые слова", item.keywords, true], ["Описание", item.overview, true], ["Заметка", item.notes, true], ["Raw · исходный ввод", formatRaw(item.raw_json), true]
   ];
-  const cards = fields.map(([label,value,wide]) => `<div class="detail ${wide ? "wide" : ""}"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
+  const cards = fields.map(([label,value,wide]) => detailFieldHtml(label,value,wide,label === "Заметка" ? item.id : "")).join("");
   const links = `<div class="detail wide"><span>Ссылки</span><p class="detail-links">${movieLinksHtml(item, true)}${validUrl(item.homepage) ? ` <a href="${escapeHtml(item.homepage)}" target="_blank" rel="noreferrer">Сайт ↗</a>` : ""}</p></div>`;
   const poster = item.poster_local_path || item.poster_path || validUrl(item.poster_url) ? `<div class="detail wide"><span>Постер</span>${moviePosterHtml(item,"detail-poster")}</div>` : "";
   $("#details-content").innerHTML = poster + cards + links;
   if (!$("#details-dialog").open) $("#details-dialog").showModal();
 }
 
+function detailFieldHtml(label, value, wide = false, editableItemId = "") {
+  const editable = editableItemId && state.currentDetailId === editableItemId;
+  return `<div class="detail ${wide ? "wide" : ""}${editable ? " editable-note" : ""}"${editable ? ` data-editable-note="${escapeHtml(editableItemId)}" title="Дважды нажмите, чтобы изменить заметку"` : ""}><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`;
+}
+
+function editNote(field) {
+  const itemId = field.dataset.editableNote;
+  const item = state.items.find(existing => existing.id === itemId);
+  if (!item || field.querySelector("textarea")) return;
+  const paragraph = field.querySelector("p"), editor = document.createElement("textarea");
+  editor.className = "inline-note-editor";
+  editor.value = item.notes || "";
+  editor.setAttribute("aria-label", "Заметка");
+  paragraph.replaceWith(editor);
+  editor.focus();
+  editor.setSelectionRange(editor.value.length,editor.value.length);
+  let finished = false;
+  const cancel = () => {
+    if (finished) return;
+    finished = true;
+    const restored = document.createElement("p");
+    restored.textContent = text(item.notes);
+    editor.replaceWith(restored);
+  };
+  const save = async () => {
+    if (finished) return;
+    finished = true;
+    const notes = editor.value;
+    editor.disabled = true;
+    try {
+      const {item:updated} = await request(`/api/library/${encodeURIComponent(itemId)}`, {method:"PATCH",body:JSON.stringify({notes})});
+      state.items = state.items.map(existing => existing.id === updated.id ? updated : existing);
+      const saved = document.createElement("p");
+      saved.textContent = text(updated.notes);
+      editor.replaceWith(saved);
+      renderLibrary();
+      toast("Заметка сохранена");
+    } catch (error) {
+      finished = false;
+      editor.disabled = false;
+      editor.focus();
+      toast(error.message);
+    }
+  };
+  editor.addEventListener("blur",save);
+  editor.addEventListener("keydown",event=>{
+    if(event.key === "Escape"){event.preventDefault();cancel();return;}
+    if(event.key === "Enter" && (event.metaKey || event.ctrlKey)){event.preventDefault();editor.blur();}
+  });
+}
+
 async function patchItem(id, changes) {
   const {item} = await request(`/api/library/${encodeURIComponent(id)}`, {method:"PATCH", body:JSON.stringify(changes)});
   state.items = state.items.map(existing => existing.id === item.id ? item : existing); renderLibrary(); toast(state.contentType === "music" ? "Музыкальная библиотека обновлена" : "Фильмотека обновлена");
+}
+
+const actionDelay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function actionFeedbackContainer(button) {
+  return button.closest("tr, .rated-card");
+}
+
+function clearActionFeedback(button, container) {
+  delete button.dataset.actionBusy;
+  button.removeAttribute("aria-disabled");
+  button.classList.remove("is-confirming");
+  container?.classList.remove("action-pending", "action-exiting");
+}
+
+async function patchItemWithFeedback(button, id, changes, {exit = false} = {}) {
+  if (button.dataset.actionBusy) return;
+  const container = actionFeedbackContainer(button);
+  button.dataset.actionBusy = "true";
+  button.setAttribute("aria-disabled", "true");
+  button.classList.add("is-confirming");
+  container?.classList.add("action-pending");
+  const outcomePromise = request(`/api/library/${encodeURIComponent(id)}`, {
+    method:"PATCH", body:JSON.stringify(changes),
+  }).then(value => ({value}), error => ({error}));
+  await actionDelay(123);
+  const outcome = await outcomePromise;
+  if (outcome.error) {
+    clearActionFeedback(button, container);
+    toast(outcome.error.message);
+    return;
+  }
+  if (exit && container) {
+    button.classList.remove("is-confirming");
+    container.classList.add("action-exiting");
+    await actionDelay(118);
+  }
+  const updated = outcome.value.item;
+  state.items = state.items.map(existing => existing.id === updated.id ? updated : existing);
+  renderLibrary();
+  toast(state.contentType === "music" ? "Музыкальная библиотека обновлена" : "Фильмотека обновлена");
 }
 
 async function toggleFavorite(button) {
@@ -441,14 +569,14 @@ function renderPeople() {
   if (state.contentType === "music") {
     const artists=sortedPeople(people,"artist");
     $("#movie-people-board").classList.add("hidden"); $("#music-people-board").classList.remove("hidden");
-    $("#artists-body").innerHTML = artists.length ? artists.map(item => `<tr class="person-row" data-person-details-id="${escapeHtml(item.id)}" tabindex="0"><td><strong>${escapeHtml(text(item.name_original))}</strong></td><td>${escapeHtml(text(item.artist_type))}</td><td>${escapeHtml(text(item.country || item.area))}</td><td>${escapeHtml(text(item.mbid))}</td><td><button class="icon-button trash-button" data-trash-entity="music_artist" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить исполнителя в корзину">🗑</button></td></tr>`).join("") : `<tr><td colspan="5" class="empty">Ничего не найдено</td></tr>`;
+    $("#artists-body").innerHTML = artists.length ? artists.map(item => `<tr class="person-row" data-person-details-id="${escapeHtml(item.id)}" tabindex="0"><td class="person-photo-cell">${personPhotoHtml(item)}</td><td><strong>${escapeHtml(text(item.name_original))}</strong></td><td>${escapeHtml(text(item.artist_type))}</td><td>${escapeHtml(text(item.country || item.area))}</td><td><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="music_artist" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить исполнителя в корзину">${actionIcon("trash")}</button></td></tr>`).join("") : `<tr><td colspan="5" class="empty">Ничего не найдено</td></tr>`;
     $("#artists-count").textContent = artists.length; $("#people-count").textContent = artists.length; updatePeopleSortIndicators();
     return;
   }
   $("#movie-people-board").classList.remove("hidden"); $("#music-people-board").classList.add("hidden");
   for (const role of ["director", "actor"]) {
     const rows = sortedPeople(people.filter(item => item.role === role),role);
-    $(`#${role}s-body`).innerHTML = rows.length ? rows.map(item => `<tr class="person-row" data-person-details-id="${escapeHtml(item.id)}" tabindex="0" aria-label="Открыть карточку: ${escapeHtml(titlePerson(item))}"><td><strong>${escapeHtml(text(item.name_ru))}</strong></td><td>${escapeHtml(text(item.name_original))}</td><td>${escapeHtml(text(item.tmdb_id))}</td><td><button class="icon-button trash-button" data-trash-entity="person" data-id="${escapeHtml(item.id)}" data-role="${role}" title="В корзину" aria-label="Переместить персону в корзину">🗑</button></td></tr>`).join("") : `<tr><td colspan="4" class="empty">Ничего не найдено</td></tr>`;
+    $(`#${role}s-body`).innerHTML = rows.length ? rows.map(item => `<tr class="person-row" data-person-details-id="${escapeHtml(item.id)}" tabindex="0" aria-label="Открыть карточку: ${escapeHtml(titlePerson(item))}"><td class="person-photo-cell">${personPhotoHtml(item)}</td><td><strong>${escapeHtml(text(item.name_ru))}</strong></td><td>${escapeHtml(text(item.name_original))}</td><td><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="person" data-id="${escapeHtml(item.id)}" data-role="${role}" title="В корзину" aria-label="Переместить персону в корзину">${actionIcon("trash")}</button></td></tr>`).join("") : `<tr><td colspan="4" class="empty">Ничего не найдено</td></tr>`;
     $(`#${role}s-count`).textContent = rows.length;
   }
   $("#people-count").textContent = people.length; updatePeopleSortIndicators();
@@ -462,7 +590,7 @@ function showPersonDetails(person) {
     $("#person-details-role").textContent = "Карточка исполнителя";
     $("#refresh-person-detail").textContent = "↻ Актуализировать из MusicBrainz";
     const fields = [["Исполнитель",person.name_original],["Тип",person.artist_type],["Страна",person.country],["Регион",person.area],["Период",[person.life_span_begin,person.life_span_end].filter(Boolean).join(" — ")],["Уточнение",person.disambiguation],["MusicBrainz ID",person.mbid],["Raw · исходный ввод",formatRaw(person.raw_json)]];
-    $("#person-details-content").innerHTML = fields.map(([label,value]) => `<div class="detail"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
+    $("#person-details-content").innerHTML = `<div class="detail wide"><span>Фото</span>${personPhotoHtml(person,"detail-person-photo")}</div>` + fields.map(([label,value]) => `<div class="detail"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
     if (!$("#person-details-dialog").open) $("#person-details-dialog").showModal();
     return;
   }
@@ -474,7 +602,7 @@ function showPersonDetails(person) {
     ["TMDB ID", person.tmdb_id],
     ["Raw · исходный ввод", formatRaw(person.raw_json)],
   ];
-  $("#person-details-content").innerHTML = fields.map(([label, value]) => `<div class="detail"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
+  $("#person-details-content").innerHTML = `<div class="detail wide"><span>Фото</span>${personPhotoHtml(person,"detail-person-photo")}</div>` + fields.map(([label, value]) => `<div class="detail"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
   if (!$("#person-details-dialog").open) $("#person-details-dialog").showModal();
 }
 
@@ -529,8 +657,8 @@ function renderInterestOptions() {
   }
   for (const role of ["actor","director"]) {
     const items = state.interests.filter(item => item.role === role);
-    $(`#${role}-options`).innerHTML = items.map(item => `<label><input type="checkbox" name="${role}_ids" value="${escapeHtml(item.id)}" checked> ${escapeHtml(item.name_original)}</label>`).join("");
-    document.querySelector(`[data-select-all="${role}"]`).checked = true;
+    $(`#${role}-options`).innerHTML = items.map(item => `<label><input type="checkbox" name="${role}_ids" value="${escapeHtml(item.id)}"> ${escapeHtml(item.name_original)}</label>`).join("");
+    document.querySelector(`[data-select-all="${role}"]`).checked = false;
     filterPersonOptions(role);
   }
   updateSelectedLabels();
@@ -563,12 +691,13 @@ function applyContentLabels() {
   const music = state.contentType === "music";
   document.querySelectorAll("[data-content-type]").forEach(button=>{const active=button.dataset.contentType===state.contentType;button.classList.toggle("active",active);button.setAttribute("aria-pressed",String(active));});
   $("#backlog-empty").textContent = music ? "В музыкальном бэклоге ничего нет." : "В бэклоге ничего нет.";
-  $("#open-backlog-recommend").textContent = "✦ Рекомендовать";
-  $("#refresh-tmdb").textContent = "↻ Актуализировать";
-  $("#refresh-people").textContent = "↻ Актуализировать";
-  $("#open-people-recommend").textContent = "✦ Рекомендовать";
-  $("#open-add").textContent = "+ Добавить";
-  $("#open-add-person").textContent = "+ Добавить";
+  $("#open-backlog-recommend").textContent = "✦ Подобрать похожее";
+  $("#open-backlog-api-recommend").textContent = "↻ Новое от авторов";
+  $("#refresh-tmdb").textContent = "⟳ Обновить";
+  $("#refresh-people").textContent = "⟳ Обновить";
+  $("#open-people-recommend").textContent = "✦ Рекомендовать похожее";
+  $("#open-add").textContent = "＋ Добавить вручную";
+  $("#open-add-person").textContent = "＋ Добавить вручную";
   syncSearchControls();
 }
 
@@ -635,13 +764,37 @@ async function addFilteredRecommendation(index, button) {
 }
 
 async function refreshTmdb() {
-  const button = $("#refresh-tmdb"), notice = $("#refresh-progress"), music = state.contentType === "music"; button.disabled = true; notice.classList.remove("hidden","error","warning"); notice.textContent = music ? "Полностью актуализирую неполные карточки через MusicBrainz и ListenBrainz…" : "Полностью актуализирую неполные карточки через нужные источники…";
-  try { const result = await request(music ? "/api/library/refresh-musicbrainz" : "/api/library/refresh-tmdb", {method:"POST",body:"{}"}); state.items = (await request(`/api/library?content_type=${state.contentType}`)).items; renderLibrary(); const warnings = providerWarnings([{provider_warnings:result.provider_warnings || []}]); notice.textContent = `Обновлено ${result.updated} из ${result.total}. Ошибок: ${result.failed}.${warnings.length ? ` ${warnings.join(" ")}` : ""}`; if (result.failed) notice.classList.add("error"); else if (warnings.length) notice.classList.add("warning"); if (warnings.length) toast(warnings[0]); }
-  catch (error) { notice.textContent = error.message; notice.classList.add("error"); } finally { button.disabled = false; }
+  if(operationRunning()){toast("Дождитесь завершения текущей операции или остановите её");return;}
+  const button = $("#refresh-tmdb"), recommendButtons = [$("#open-backlog-recommend"),$("#open-backlog-api-recommend")], notice = $("#refresh-progress"), music = state.contentType === "music";
+  button.closest("details")?.removeAttribute("open");
+  const progressId = globalThis.crypto?.randomUUID?.() || `refresh-${Date.now()}-${Math.random()}`;
+  button.disabled = true; recommendButtons.forEach(item=>{item.disabled=true;});
+  notice.classList.remove("hidden","error","warning");
+  notice.textContent = music ? "Полностью актуализирую неполные карточки через MusicBrainz и ListenBrainz…" : "Полностью актуализирую неполные карточки через нужные источники…";
+  startRecommendationProgress(
+    progressId, 1, music ? "MusicBrainz · подготовка карточек" : "TMDB · подготовка карточек", "шагов",
+    {container:"#refresh-operation-progress",stages:"#refresh-progress-stages",stop:"#refresh-stop",kind:"refresh",warnings:false},
+  );
+  try {
+    const result = await request(music ? "/api/library/refresh-musicbrainz" : "/api/library/refresh-tmdb", {
+      method:"POST",body:JSON.stringify({progress_id:progressId}),
+    });
+    state.items = (await request(`/api/library?content_type=${state.contentType}`)).items;
+    renderLibrary();
+    const warnings = providerWarnings([{provider_warnings:result.provider_warnings || []}]);
+    notice.textContent = `${result.cancelled ? "Остановлено. " : ""}Обновлено ${result.updated} из ${result.total}. Ошибок: ${result.failed}.${warnings.length ? ` ${warnings.join(" ")}` : ""}`;
+    if (result.failed) notice.classList.add("error"); else if (warnings.length) notice.classList.add("warning");
+    if (warnings.length) toast(warnings[0]);
+  } catch (error) {
+    notice.textContent = error.message; notice.classList.add("error");
+  } finally {
+    await finishRecommendationProgress(progressId);
+    button.disabled = false; recommendButtons.forEach(item=>{item.disabled=false;});
+  }
 }
 
 async function refreshPeople() {
-  const button = $("#refresh-people"), notice = $("#people-refresh-progress"), music = state.contentType === "music"; button.disabled = true; notice.classList.remove("hidden","error"); notice.textContent = music ? "Сверяю исполнителей с MusicBrainz…" : "Сверяю имена и TMDB ID…";
+  const button = $("#refresh-people"), notice = $("#people-refresh-progress"), music = state.contentType === "music"; button.closest("details")?.removeAttribute("open");button.disabled = true; notice.classList.remove("hidden","error"); notice.textContent = music ? "Ищу MusicBrainz ID для исполнителей без идентификатора…" : "Ищу TMDB ID для персон без идентификатора…";
   try { const result = await request(music ? "/api/people/refresh-musicbrainz" : "/api/people/refresh-tmdb", {method:"POST",body:"{}"}); state.interests = (await request(`/api/people?content_type=${state.contentType}`)).items; renderPeople(); renderInterestOptions(); notice.textContent = `Обновлено ${result.updated} из ${result.total}. Ошибок: ${result.failed}.`; if (result.failed) notice.classList.add("error"); }
   catch (error) { notice.textContent = error.message; notice.classList.add("error"); } finally { button.disabled = false; }
 }
@@ -771,11 +924,35 @@ async function reloadActiveData() {
 }
 
 async function moveToTrash(button) {
-  button.disabled = true;
+  if (button.dataset.actionBusy) return;
+  const container = actionFeedbackContainer(button);
+  button.dataset.actionBusy = "true";
+  button.setAttribute("aria-disabled", "true");
+  button.classList.add("is-confirming");
+  container?.classList.add("action-pending");
+  const outcomePromise = request("/api/trash", {
+    method:"POST",
+    body:JSON.stringify({entity_type:button.dataset.trashEntity, entity_id:button.dataset.id, role:button.dataset.role || ""}),
+  }).then(value => ({value}), error => ({error}));
+  await actionDelay(123);
+  const outcome = await outcomePromise;
+  if (outcome.error) {
+    clearActionFeedback(button, container);
+    toast(outcome.error.message);
+    return;
+  }
+  button.classList.remove("is-confirming");
+  if (container) {
+    container.classList.add("action-exiting");
+    await actionDelay(118);
+  }
   try {
-    await request("/api/trash", {method:"POST", body:JSON.stringify({entity_type:button.dataset.trashEntity, entity_id:button.dataset.id, role:button.dataset.role || ""})});
-    await reloadActiveData(); toast("Перемещено в корзину");
-  } catch (error) { button.disabled = false; toast(error.message); }
+    await reloadActiveData();
+    toast("Перемещено в корзину");
+  } catch (error) {
+    container?.remove();
+    toast(`Перемещено в корзину, но список не обновлён: ${error.message}`);
+  }
 }
 
 async function restoreFromTrash(button) {
@@ -811,6 +988,7 @@ function renderRecommendationHead() {
 }
 
 function setBacklogRecommendMode(mode) {
+  if(activeOperations.recommendation){toast("Сначала остановите текущую рекомендацию");return;}
   state.backlogRecommendMode = mode;
   if (recommendationProgressTimer) clearInterval(recommendationProgressTimer);
   recommendationProgressTimer = null;
@@ -829,20 +1007,29 @@ function setBacklogRecommendMode(mode) {
   $("#backlog-recommend-error").textContent = ""; $("#backlog-api-error").textContent = ""; $("#album-recommend-error").textContent = ""; $("#album-api-error").textContent = "";
 }
 
-function openBacklogRecommendation() {
+function openBacklogRecommendation(mode = "llm") {
+  if(operationRunning()){toast("Дождитесь завершения текущей операции или остановите её");return;}
   const currentYear = new Date().getFullYear();
   for (const yearTo of [$("#backlog-year-to"), $("#api-year-to"), $("#album-llm-year-to"), $("#album-api-year-to")]) {
     yearTo.max = String(currentYear + 2); yearTo.value = String(currentYear);
   }
-  state.llmItems = []; state.llmFilteredItems = []; state.apiItems = []; state.apiFilteredItems = []; state.llmErrors = []; state.apiProgressWarnings = []; state.recommendationSort = {key:"year",direction:"desc"};
+  state.llmItems = []; state.llmFilteredItems = []; state.apiItems = []; state.apiFilteredItems = []; state.llmErrors = []; state.llmRawResponse = ""; state.recommendationCancelled = false; state.apiProgressWarnings = []; state.recommendationSort = {key:"year",direction:"desc"};
   state.llmContextSeed = globalThis.crypto?.randomUUID?.() || `context-${Date.now()}-${Math.random()}`;
-  $("#backlog-recommend-error").textContent = ""; $("#backlog-recommend-result").classList.add("hidden"); $("#backlog-recommend-body").innerHTML = ""; $("#backlog-filtered-result").classList.add("hidden"); $("#backlog-filtered-body").innerHTML = ""; $("#backlog-filtered-summary").innerHTML = ""; $("#open-filtered-reasons").classList.add("hidden"); $("#backlog-recommend-message").textContent = "";
+  $("#backlog-recommend-error").textContent = ""; $("#backlog-recommend-result").classList.add("hidden"); $("#backlog-recommend-body").innerHTML = ""; $("#backlog-filtered-result").classList.add("hidden"); $("#backlog-filtered-body").innerHTML = ""; $("#backlog-filtered-summary").innerHTML = ""; $("#open-filtered-reasons").classList.add("hidden"); $("#open-llm-raw-response").classList.add("hidden"); $("#backlog-recommend-message").textContent = "";
   const provider = state.llm.provider || "Codex SDK", model = state.llm.model ? ` · ${state.llm.model}` : "";
   $("#backlog-recommend-provider").textContent = `${provider}${model}${state.llm.configured === false ? " · требуется установка" : ""}`;
   $("#backlog-api-provider").textContent = state.tmdb.configured ? `TMDB · подключён${state.tmdb.omdb_configured ? " · OMDb" : ""}${state.tmdb.kinopoisk_configured ? " · КП" : ""}` : "TMDB · нужен ключ";
-  $("#recommend-title").textContent = state.contentType === "music" ? "Порекомендовать альбомы" : "Порекомендовать фильмы";
-  const apiModeButton = document.querySelector('[data-backlog-recommend-mode="api"]'); apiModeButton.textContent = state.contentType === "music" ? "Рекомендации по API MusicBrainz" : "Рекомендации по API TMDB";
-  setBacklogRecommendMode("llm");
+  setBacklogRecommendMode(mode);
+  if (mode === "api" && state.contentType === "movie") {
+    document.querySelectorAll('input[name="actor_ids"],input[name="director_ids"]').forEach(box => { box.checked = false; });
+    updateSelectedLabels();
+  }
+  $("#recommend-eyebrow").textContent = mode === "llm"
+    ? "Codex · персональный подбор"
+    : `${state.contentType === "music" ? "MusicBrainz" : "TMDB"} · подбор по авторам`;
+  $("#recommend-title").textContent = mode === "llm"
+    ? (state.contentType === "music" ? "Подобрать похожие альбомы" : "Подобрать похожие фильмы")
+    : "Новое от авторов";
   $("#backlog-recommend-dialog").showModal();
 }
 
@@ -857,16 +1044,16 @@ async function runBacklogRecommendation(event) {
     payload.progress_id = progressId;
     startRecommendationProgress(progressId, 1, "Codex · запрос к LLM", "запросов");
     const result = await request("/api/recommendations/llm", {method:"POST", body:JSON.stringify(payload)});
-    state.llmItems = result.items || []; state.llmFilteredItems = result.filtered_items || []; state.llmErrors = result.errors || []; renderLlmRecommendations();
+    state.llmItems = result.items || []; state.llmFilteredItems = result.filtered_items || []; state.llmErrors = result.errors || []; state.llmRawResponse = result.raw_response || ""; state.recommendationCancelled = Boolean(result.cancelled); renderLlmRecommendations();
     if (result.provider_warnings?.length) showProviderWarnings([{provider_warnings:result.provider_warnings}]);
     $("#backlog-recommend-result-source").textContent = music ? "Codex + MusicBrainz" : "Codex + TMDB + OMDb + Кинопоиск";
     $("#backlog-recommend-model").textContent = result.model || "Codex"; resultNode.classList.remove("hidden");
   } catch (error) { errorNode.textContent = error.message; }
-  finally { if (progressId) await finishRecommendationProgress(progressId); button.disabled = false; button.textContent = "Порекомендовать"; }
+  finally { if (progressId) await finishRecommendationProgress(progressId); button.disabled = false; button.textContent = "Подобрать похожее"; }
 }
 
 let recommendationProgressTimer = null;
-let recommendationProgressTarget = {container:"#api-recommend-progress",stages:"#api-recommend-progress-stages",warnings:true};
+let recommendationProgressTarget = {container:"#api-recommend-progress",stages:"#api-recommend-progress-stages",stop:"#recommend-stop",kind:"recommendation",warnings:true};
 function renderRecommendationProgress(value) {
   const stages = value.stages?.length ? value.stages : [{label:value.label || "API · обработка",processed:value.processed,total:value.total,unit:value.unit || "объектов"}];
   $(recommendationProgressTarget.container).classList.remove("hidden");
@@ -890,12 +1077,18 @@ async function pollApiProgress(progressId) {
     const response = await fetch(`/api/recommendations/progress?id=${encodeURIComponent(progressId)}`);
     if (!response.ok) return;
     const value = await response.json();
-    if (value.found) { renderRecommendationProgress(value); if(recommendationProgressTarget.warnings)updateApiProgressWarnings(value.warnings || []); }
+    if (value.found) {
+      renderRecommendationProgress(value);
+      if(value.cancel_requested && recommendationProgressTarget.stop){const stop=$(recommendationProgressTarget.stop);stop.disabled=true;stop.textContent="Останавливаю…";}
+      if(recommendationProgressTarget.warnings)updateApiProgressWarnings(value.warnings || []);
+    }
   } catch {}
 }
 function startRecommendationProgress(progressId, total, label, unit = "объектов", target = null) {
   if (recommendationProgressTimer) clearInterval(recommendationProgressTimer);
-  recommendationProgressTarget = target || {container:"#api-recommend-progress",stages:"#api-recommend-progress-stages",warnings:true};
+  recommendationProgressTarget = target || {container:"#api-recommend-progress",stages:"#api-recommend-progress-stages",stop:"#recommend-stop",kind:"recommendation",warnings:true};
+  if(recommendationProgressTarget.kind)activeOperations[recommendationProgressTarget.kind]=progressId;
+  if(recommendationProgressTarget.stop){const stop=$(recommendationProgressTarget.stop);stop.classList.remove("hidden");stop.disabled=false;stop.textContent="Стоп";}
   state.apiProgressWarnings = [];
   renderRecommendationProgress({processed:0,total,label,unit,stages:[]});
   recommendationProgressTimer = setInterval(() => pollApiProgress(progressId), 500);
@@ -905,6 +1098,19 @@ async function finishRecommendationProgress(progressId) {
   recommendationProgressTimer = null;
   await pollApiProgress(progressId);
   $(recommendationProgressTarget.container).classList.add("hidden");
+  if(recommendationProgressTarget.stop){const stop=$(recommendationProgressTarget.stop);stop.classList.add("hidden");stop.disabled=false;stop.textContent="Стоп";}
+  if(recommendationProgressTarget.kind&&activeOperations[recommendationProgressTarget.kind]===progressId)activeOperations[recommendationProgressTarget.kind]="";
+}
+
+async function stopOperation(kind, button) {
+  const progressId = activeOperations[kind];
+  if (!progressId) return;
+  button.disabled = true; button.textContent = "Останавливаю…";
+  try {
+    await request("/api/operations/cancel", {method:"POST",body:JSON.stringify({progress_id:progressId})});
+  } catch (error) {
+    button.disabled = false; button.textContent = "Стоп"; toast(error.message);
+  }
 }
 
 function renderPeopleRecommendations() {
@@ -913,20 +1119,19 @@ function renderPeopleRecommendations() {
     const localized = item.name_ru || item.name_original, original = item.name_original || "";
     const names = `<strong>${escapeHtml(text(localized))}</strong>${original && original !== localized ? `<br><span class="cell-muted">${escapeHtml(original)}</span>` : ""}`;
     const role = music ? (item.artist_type || "Исполнитель") : item.role === "director" ? "Режиссёр" : "Актёр";
-    const providerData = music
-      ? [item.country || item.area, item.mbid ? `MBID: ${item.mbid}` : ""].filter(Boolean).join(" · ")
-      : item.tmdb_id ? `TMDB ID: ${item.tmdb_id}` : "—";
-    return `<tr><td>${names}</td><td>${escapeHtml(role)}</td><td>${escapeHtml(text(providerData))}</td><td>${escapeHtml(text(item.llm_comment || item.notes))}</td><td><div class="table-actions"><button class="mini-button done" data-add-recommended-person="${index}">Добавить</button><button class="mini-button remove" data-remove-recommended-person="${index}">Убрать</button></div></td></tr>`;
+    return `<tr><td class="person-photo-cell">${personPhotoHtml(item)}</td><td>${names}</td><td>${escapeHtml(role)}</td><td>${escapeHtml(text(item.llm_comment || item.notes))}</td><td><div class="table-actions"><button class="mini-button done" data-add-recommended-person="${index}">Добавить</button><button class="mini-button remove" data-remove-recommended-person="${index}">Убрать</button></div></td></tr>`;
   }).join("") : `<tr><td colspan="5" class="empty">Подходящих новых рекомендаций не найдено</td></tr>`;
   const errors = state.peopleRecommendationErrors;
+  const prefix = state.peopleRecommendationCancelled ? "Остановлено. " : "";
   $("#people-recommend-message").textContent = errors.length
-    ? `Показано: ${items.length}. Не удалось обработать или исключено как повтор: ${errors.length}.`
-    : `Показано рекомендаций: ${items.length}.`;
+    ? `${prefix}Показано: ${items.length}. Не удалось обработать или исключено как повтор: ${errors.length}.`
+    : `${prefix}Показано рекомендаций: ${items.length}.`;
 }
 
 function openPeopleRecommendation() {
+  if(operationRunning()){toast("Дождитесь завершения текущей операции или остановите её");return;}
   const music = state.contentType === "music", provider = state.llm.provider || "Codex SDK";
-  state.peopleRecommendationItems = []; state.peopleRecommendationErrors = [];
+  state.peopleRecommendationItems = []; state.peopleRecommendationErrors = []; state.peopleRecommendationCancelled = false;
   $("#people-recommend-form").reset();
   $("#people-recommend-title").textContent = music ? "Порекомендовать исполнителя" : "Порекомендовать персону";
   $("#people-recommend-form textarea").placeholder = music
@@ -952,10 +1157,11 @@ async function runPeopleRecommendation(event) {
   let progressId = "";
   try {
     progressId = globalThis.crypto?.randomUUID?.() || `people-recommend-${Date.now()}-${Math.random()}`;
-    const payload = {content_type:state.contentType,prompt:String(new FormData(event.currentTarget).get("prompt") || ""),progress_id:progressId};
-    startRecommendationProgress(progressId,1,"Codex · запрос к LLM","запросов",{container:"#people-recommend-progress",stages:"#people-recommend-progress-stages",warnings:false});
+    const formData = new FormData(event.currentTarget);
+    const payload = {content_type:state.contentType,prompt:String(formData.get("prompt") || ""),limit:formData.get("limit"),progress_id:progressId};
+    startRecommendationProgress(progressId,1,"Codex · запрос к LLM","запросов",{container:"#people-recommend-progress",stages:"#people-recommend-progress-stages",stop:"#people-recommend-stop",kind:"people",warnings:false});
     const result = await request("/api/recommendations/people/llm",{method:"POST",body:JSON.stringify(payload)});
-    state.peopleRecommendationItems = result.items || []; state.peopleRecommendationErrors = result.errors || [];
+    state.peopleRecommendationItems = result.items || []; state.peopleRecommendationErrors = result.errors || []; state.peopleRecommendationCancelled = Boolean(result.cancelled);
     renderPeopleRecommendations();
     $("#people-recommend-result-source").textContent = state.contentType === "music" ? "Codex + MusicBrainz" : "Codex + TMDB";
     $("#people-recommend-model").textContent = result.model || "Codex";
@@ -979,17 +1185,24 @@ async function addRecommendedPerson(index, button) {
 async function runBacklogApiRecommendation(event) {
   event.preventDefault();
   const music = state.contentType === "music", button = $(music ? "#album-api-submit" : "#backlog-api-submit"), errorNode = $(music ? "#album-api-error" : "#backlog-api-error"), resultNode = $("#backlog-recommend-result");
+  const values = recommendationValues(event.currentTarget);
+  if (!music && values.actor_ids.length + values.director_ids.length === 0) {
+    const message = "Нужно выбрать хотя бы одного актёра или режиссёра.";
+    errorNode.textContent = message;
+    window.alert(message);
+    return;
+  }
   button.disabled = true; button.textContent = "Ищу и уточняю…"; errorNode.textContent = ""; resultNode.classList.add("hidden"); $("#backlog-recommend-warning").classList.add("hidden");
   let progressId = "";
   try {
-    const values = recommendationValues(event.currentTarget), payload = {...values};
+    const payload = {...values};
     progressId = globalThis.crypto?.randomUUID?.() || `recommend-${Date.now()}-${Math.random()}`;
     payload.progress_id = progressId;
     const personTotal = music ? values.artist_ids.length : values.actor_ids.length + values.director_ids.length;
     startRecommendationProgress(progressId, personTotal, music ? "MusicBrainz · альбомы исполнителей" : "TMDB · фильмы персон", music ? "исполнителей" : "персон");
     if (music) {
       const result = await request("/api/recommendations/musicbrainz", {method:"POST",body:JSON.stringify(payload)});
-      state.apiItems = result.items || []; state.apiFilteredItems = result.filtered_items || []; state.llmErrors = result.errors || []; renderApiRecommendations();
+      state.apiItems = result.items || []; state.apiFilteredItems = result.filtered_items || []; state.llmErrors = result.errors || []; state.recommendationCancelled = Boolean(result.cancelled); renderApiRecommendations();
       if (result.provider_warnings?.length) showProviderWarnings([{provider_warnings:result.provider_warnings}]);
       $("#backlog-recommend-result-source").textContent = "MusicBrainz"; $("#backlog-recommend-model").textContent = "MusicBrainz API v2"; resultNode.classList.remove("hidden"); return;
     }
@@ -999,7 +1212,7 @@ async function runBacklogApiRecommendation(event) {
     delete payload.year_to;
     if (values.excluded_genres !== undefined) payload.excluded_genres = String(values.excluded_genres).split(",").map(value => value.trim()).filter(Boolean);
     const result = await request("/api/recommendations/tmdb", {method:"POST", body:JSON.stringify(payload)});
-    state.apiItems = result.items || []; state.apiFilteredItems = result.filtered_items || []; state.llmErrors = result.errors || []; renderApiRecommendations();
+    state.apiItems = result.items || []; state.apiFilteredItems = result.filtered_items || []; state.llmErrors = result.errors || []; state.recommendationCancelled = Boolean(result.cancelled); renderApiRecommendations();
     $("#backlog-recommend-result-source").textContent = "TMDB + OMDb + Кинопоиск";
     $("#backlog-recommend-model").textContent = "TMDB API"; resultNode.classList.remove("hidden");
   } catch (error) { errorNode.textContent = error.message; }
@@ -1032,12 +1245,15 @@ function hideLlmPromptPreview() {
 
 document.addEventListener("click", async event => {
   const activeFilterDetails=event.target.closest(".people-filter details");document.querySelectorAll(".people-filter details[open]").forEach(details=>{if(details!==activeFilterDetails)details.removeAttribute("open");});
-  const contentType=event.target.closest("[data-content-type]");if(contentType){if(contentType.dataset.contentType!==state.contentType){try{await changeContentType(contentType.dataset.contentType);}catch(error){toast(error.message);}}return;}
+  const activeToolbarMenu=event.target.closest(".toolbar-overflow");document.querySelectorAll(".toolbar-overflow[open]").forEach(details=>{if(details!==activeToolbarMenu)details.removeAttribute("open");});
+  const operationStop=event.target.closest("[data-stop-operation]");if(operationStop){await stopOperation(operationStop.dataset.stopOperation,operationStop);return;}
+  const contentType=event.target.closest("[data-content-type]");if(contentType){if(operationRunning()){toast("Дождитесь завершения текущей операции или остановите её");return;}if(contentType.dataset.contentType!==state.contentType){try{await changeContentType(contentType.dataset.contentType);}catch(error){toast(error.message);}}return;}
   const nav = event.target.closest("[data-view]"); if (nav) { switchView(nav.dataset.view); return; }
   const filteredReasons = event.target.closest("[data-open-filtered-reasons]"); if (filteredReasons) { if(currentFilteredRecommendations().length) $("#filtered-reasons-dialog").showModal();return; }
+  const rawResponse = event.target.closest("[data-open-llm-raw-response]"); if (rawResponse) { if(state.llmRawResponse){$("#llm-raw-response-output").textContent=state.llmRawResponse;$("#llm-raw-response-dialog").showModal();}return; }
   const promptPreview = event.target.closest("[data-view-llm-prompt]"); if (promptPreview) { await toggleLlmPromptPreview(promptPreview); return; }
-  const close = event.target.closest("[data-close-dialog]"); if (close) { $(`#${close.dataset.closeDialog}`).close(); return; }
-  const sort = event.target.closest("[data-sort]"); if (sort) { const key=sort.dataset.sort; state.sortDirection = state.sortKey === key && state.sortDirection === "asc" ? "desc" : "asc"; state.sortKey=key; renderLibrary(); return; }
+  const close = event.target.closest("[data-close-dialog]"); if (close) { if((close.dataset.closeDialog==="backlog-recommend-dialog"&&activeOperations.recommendation)||(close.dataset.closeDialog==="people-recommend-dialog"&&activeOperations.people)){toast("Сначала остановите текущую рекомендацию");return;}$(`#${close.dataset.closeDialog}`).close(); return; }
+  const sort = event.target.closest("[data-sort]"); if (sort) { const key=sort.dataset.sort; state.sortDirection = state.sortKey === key ? (state.sortDirection === "asc" ? "desc" : "asc") : (key === "planned_soon" ? "desc" : "asc"); state.sortKey=key; renderLibrary(); return; }
   const recommendationSort = event.target.closest("[data-recommend-sort]"); if (recommendationSort) { const key=recommendationSort.dataset.recommendSort,setting=state.recommendationSort;setting.direction=setting.key===key&&setting.direction==="asc"?"desc":"asc";setting.key=key;if(state.backlogRecommendMode==="llm")renderLlmRecommendations();else renderApiRecommendations();return; }
   const peopleSort=event.target.closest("[data-people-sort]");if(peopleSort){const role=peopleSort.dataset.peopleRole,key=peopleSort.dataset.peopleSort,setting=state.peopleSort[role];setting.direction=setting.key===key&&setting.direction==="asc"?"desc":"asc";setting.key=key;renderPeople();return;}
   const trash = event.target.closest("[data-trash-entity]"); if (trash) { await moveToTrash(trash); return; }
@@ -1049,35 +1265,37 @@ document.addEventListener("click", async event => {
   const removeRecommendedPersonButton = event.target.closest("[data-remove-recommended-person]"); if (removeRecommendedPersonButton) { state.peopleRecommendationItems.splice(Number(removeRecommendedPersonButton.dataset.removeRecommendedPerson),1);renderPeopleRecommendations();return; }
   const modalRecDetails = event.target.closest("[data-modal-rec-details]"); if (modalRecDetails) { const items=state.backlogRecommendMode === "llm" ? state.llmItems : state.apiItems; showDetails(items[Number(modalRecDetails.dataset.modalRecDetails)]); return; }
   const filteredRecDetails = event.target.closest("[data-filtered-rec-details]"); if (filteredRecDetails) { const record=currentFilteredRecommendations()[Number(filteredRecDetails.dataset.filteredRecDetails)];showDetails(record?.item);return; }
-  const itemAction = event.target.closest("[data-item-action]"); if (itemAction) { const action=itemAction.dataset.itemAction; await patchItem(itemAction.dataset.id,action === "backlog" ? {status:"backlog"} : {status:"consumed",reaction:action}); return; }
-  const reaction = event.target.closest("[data-reaction-toggle]"); if (reaction) { const item=state.items.find(x=>x.id===reaction.dataset.id); const next=item.reaction===reaction.dataset.reactionToggle ? "" : reaction.dataset.reactionToggle; await patchItem(item.id,{reaction:next}); return; }
+  const plannedSoon = event.target.closest("[data-planned-soon-toggle]"); if (plannedSoon) { const item=state.items.find(x=>x.id===plannedSoon.dataset.id);if(item)await patchItemWithFeedback(plannedSoon,item.id,{planned_soon:!item.planned_soon});return; }
+  const itemAction = event.target.closest("[data-item-action]"); if (itemAction) { const action=itemAction.dataset.itemAction;if(action === "backlog")await patchItem(itemAction.dataset.id,{status:"backlog"});else await patchItemWithFeedback(itemAction,itemAction.dataset.id,{status:"consumed",reaction:action},{exit:true});return; }
+  const reaction = event.target.closest("[data-reaction-toggle]"); if (reaction) { const item=state.items.find(x=>x.id===reaction.dataset.id);if(item){const next=item.reaction===reaction.dataset.reactionToggle ? "" : reaction.dataset.reactionToggle;await patchItemWithFeedback(reaction,item.id,{reaction:next},{exit:true});}return; }
   const favorite = event.target.closest("[data-favorite-toggle]"); if (favorite) { await toggleFavorite(favorite); return; }
   const modalRecAction = event.target.closest("[data-modal-rec-action]"); if (modalRecAction) { await addModalRecommendation(Number(modalRecAction.dataset.index),modalRecAction.dataset.modalRecAction,modalRecAction); return; }
   const filteredRecAction = event.target.closest("[data-filtered-rec-action]"); if (filteredRecAction) { await addFilteredRecommendation(Number(filteredRecAction.dataset.index),filteredRecAction); return; }
   const card = event.target.closest("[data-card-id]"); if (card) { showDetails(state.items.find(item=>item.id===card.dataset.cardId)); return; }
-  const recommendMode = event.target.closest("[data-backlog-recommend-mode]"); if (recommendMode) { setBacklogRecommendMode(recommendMode.dataset.backlogRecommendMode); return; }
   const filterToggle = event.target.closest("[data-filter-toggle]"); if (filterToggle) { const field=filterToggle.closest("[data-filter-field]"); const input=field.querySelector("input"); input.disabled=!input.disabled; field.classList.toggle("filter-disabled",input.disabled); filterToggle.setAttribute("aria-pressed",String(!input.disabled)); filterToggle.textContent=input.disabled?"—":"✓"; filterToggle.setAttribute("aria-label",`${input.disabled?"Включить":"Отключить"} фильтр ${field.dataset.filterLabel}`); if(field.closest("#backlog-recommend-form,#album-recommend-form"))hideLlmPromptPreview(); }
 });
 
 document.addEventListener("keydown", event => {
-  if(event.key==="Escape")document.querySelectorAll(".people-filter details[open]").forEach(details=>details.removeAttribute("open"));
+  if(event.key==="Escape")document.querySelectorAll(".people-filter details[open],.toolbar-overflow[open]").forEach(details=>details.removeAttribute("open"));
   if (event.key !== "Enter" && event.key !== " ") return;
   if (event.target.closest("button, a, input, select, textarea")) return;
   const card=event.target.closest("[data-card-id]"); if (card) { event.preventDefault(); showDetails(state.items.find(item=>item.id===card.dataset.cardId)); return; }
   const person=event.target.closest("[data-person-details-id]"); if (person) { event.preventDefault(); showPersonDetails(state.interests.find(item=>item.id===person.dataset.personDetailsId)); }
 });
-document.addEventListener("error",event=>{if(event.target.matches?.("[data-artwork]")){const placeholder=document.createElement("span");placeholder.className=event.target.classList.contains("movie-poster")||event.target.classList.contains("rated-card-poster")||event.target.classList.contains("detail-poster")?"movie-poster-placeholder":"album-cover-placeholder";placeholder.setAttribute("aria-hidden","true");event.target.replaceWith(placeholder);}},true);
+document.addEventListener("error",event=>{if(event.target.matches?.("[data-artwork]")){const placeholder=document.createElement("span"),isPerson=event.target.classList.contains("person-photo")||event.target.classList.contains("detail-person-photo");placeholder.className=isPerson?`person-photo-placeholder${event.target.classList.contains("detail-person-photo")?" detail-person-photo":""}`:event.target.classList.contains("movie-poster")||event.target.classList.contains("rated-card-poster")||event.target.classList.contains("detail-poster")?"movie-poster-placeholder":"album-cover-placeholder";placeholder.setAttribute("aria-hidden","true");event.target.replaceWith(placeholder);}},true);
 document.addEventListener("change", event => { const all=event.target.closest("[data-select-all]"); if (all) document.querySelectorAll(`input[name="${all.dataset.selectAll}_ids"]`).forEach(box=>box.checked=all.checked); if (all || event.target.matches('input[name="actor_ids"],input[name="director_ids"],input[name="artist_ids"]')) updateSelectedLabels(); });
 document.addEventListener("input",event=>{const search=event.target.closest("[data-person-search]");if(search)filterPersonOptions(search.dataset.personSearch);if(event.target.closest("#backlog-recommend-form,#album-recommend-form"))hideLlmPromptPreview();});
+document.addEventListener("dblclick",event=>{const note=event.target.closest("[data-editable-note]");if(note)editNote(note);});
 document.querySelectorAll(".people-filter details").forEach(details=>details.addEventListener("toggle",()=>{syncPeopleMenuLayout();if(details.open)requestAnimationFrame(()=>details.querySelector("[data-person-search]")?.focus());}));
-document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => { if (dialog.id === "backlog-recommend-dialog") return; const rect=dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); }));
+document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => { if (dialog.id === "backlog-recommend-dialog" || (dialog.id === "people-recommend-dialog" && activeOperations.people)) return; const rect=dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); }));
 $("#backlog-recommend-dialog").addEventListener("cancel", event => event.preventDefault());
+$("#people-recommend-dialog").addEventListener("cancel", event => {if(activeOperations.people){event.preventDefault();toast("Сначала остановите текущую рекомендацию");}});
 
 document.querySelectorAll("[data-library-search]").forEach(input => input.addEventListener("input", event => { state.query=event.target.value;syncSearchControls();renderLibrary();renderPeople(); })); $("#refresh-tmdb").addEventListener("click", refreshTmdb); $("#refresh-people").addEventListener("click", refreshPeople); $("#refresh-detail").addEventListener("click", refreshCurrentMovie); $("#refresh-person-detail").addEventListener("click", refreshCurrentPerson);
 $("#open-people-recommend").addEventListener("click",openPeopleRecommendation); $("#people-recommend-form").addEventListener("submit",runPeopleRecommendation);
-$("#open-backlog-recommend").addEventListener("click", openBacklogRecommendation); $("#backlog-recommend-form").addEventListener("submit", runBacklogRecommendation); $("#album-recommend-form").addEventListener("submit", runBacklogRecommendation); $("#backlog-api-form").addEventListener("submit", runBacklogApiRecommendation); $("#album-api-form").addEventListener("submit", runBacklogApiRecommendation);
-$("#open-add").addEventListener("click",()=>{ if(state.contentType === "music"){resetAlbumDraft();$("#add-album-dialog").showModal();$("#add-album-form").elements.namedItem("title_original").focus();}else{resetMovieDraft();$("#add-dialog").showModal();$("#add-form").elements.namedItem("title_ru").focus();} });
-$("#open-add-person").addEventListener("click",()=>{ if(state.contentType === "music"){state.pendingArtistDetails=null;state.pendingArtistRaw=null;$("#add-artist-form").reset();resolveStatus("#add-artist-resolve-status");$("#add-artist-error").textContent="";$("#add-artist-dialog").showModal();}else{state.pendingPersonDetails=null;state.pendingPersonRaw=null;$("#add-person-form").reset();resolveStatus("#add-person-resolve-status");$("#add-person-error").textContent="";$("#add-person-dialog").showModal();} });
+$("#open-backlog-recommend").addEventListener("click",()=>openBacklogRecommendation("llm")); $("#open-backlog-api-recommend").addEventListener("click",()=>openBacklogRecommendation("api")); $("#backlog-recommend-form").addEventListener("submit", runBacklogRecommendation); $("#album-recommend-form").addEventListener("submit", runBacklogRecommendation); $("#backlog-api-form").addEventListener("submit", runBacklogApiRecommendation); $("#album-api-form").addEventListener("submit", runBacklogApiRecommendation);
+$("#open-add").addEventListener("click",event=>{ event.currentTarget.closest("details")?.removeAttribute("open");if(state.contentType === "music"){resetAlbumDraft();$("#add-album-dialog").showModal();$("#add-album-form").elements.namedItem("title_original").focus();}else{resetMovieDraft();$("#add-dialog").showModal();$("#add-form").elements.namedItem("title_ru").focus();} });
+$("#open-add-person").addEventListener("click",event=>{ event.currentTarget.closest("details")?.removeAttribute("open");if(state.contentType === "music"){state.pendingArtistDetails=null;state.pendingArtistRaw=null;$("#add-artist-form").reset();resolveStatus("#add-artist-resolve-status");$("#add-artist-error").textContent="";$("#add-artist-dialog").showModal();}else{state.pendingPersonDetails=null;state.pendingPersonRaw=null;$("#add-person-form").reset();resolveStatus("#add-person-resolve-status");$("#add-person-error").textContent="";$("#add-person-dialog").showModal();} });
 $("#resolve-movie").addEventListener("click", resolveMovieDraft); $("#resolve-person").addEventListener("click", resolvePersonDraft); $("#resolve-album").addEventListener("click",resolveAlbumDraft); $("#resolve-artist").addEventListener("click",resolveArtistDraft);
 $("#clear-add-movie").addEventListener("click", event => {
   event.preventDefault(); event.stopPropagation(); resetMovieDraft();

@@ -22,7 +22,7 @@ from app import artwork, listenbrainz, llm, musicbrainz, recommendation_progress
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PID_FILE = Path(__file__).resolve().parents[1] / ".runtime" / "server.pid"
-APP_VERSION = 30
+APP_VERSION = 40
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -105,11 +105,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_item_artwork(self, url_path: str) -> None:
         parts = [unquote(part) for part in url_path.split("/") if part]
-        if len(parts) != 4 or parts[:2] != ["api", "artwork"] or parts[2] not in {"movie", "music"}:
+        if len(parts) != 4 or parts[:2] != ["api", "artwork"] or parts[2] not in {"movie", "music", "person"}:
             self._error("Not found", HTTPStatus.NOT_FOUND)
             return
         content_type, item_id = parts[2], parts[3]
         try:
+            if content_type == "person":
+                person = storage.get_interest_person(item_id)
+                relative = str(person.get("profile_local_path") or "")
+                if not artwork.is_cached(relative):
+                    relative = artwork.cache_person_profile(
+                        person.get("tmdb_id"), str(person.get("profile_path") or ""),
+                        str(person.get("profile_url") or ""),
+                    )
+                if not relative:
+                    self._error("Изображение отсутствует", HTTPStatus.NOT_FOUND)
+                    return
+                if relative != person.get("profile_local_path"):
+                    storage.update_person_artwork_path(
+                        item_id, relative, str(person.get("profile_path") or ""),
+                        artwork.person_profile_url(str(person.get("profile_url") or person.get("profile_path") or "")),
+                    )
+                self._serve_artwork_file(relative)
+                return
             item = storage.get_item(item_id)
             if item.get("content_type") != content_type:
                 raise storage.StorageError("Item not found")
@@ -182,16 +200,22 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/library":
                 self._json({"item": storage.add_item(payload)}, HTTPStatus.CREATED)
                 return
+            if parsed.path == "/api/operations/cancel":
+                progress_id = str(payload.get("progress_id") or "").strip()
+                if not progress_id:
+                    raise ValueError("Progress ID is required")
+                self._json({"cancel_requested": recommendation_progress.cancel(progress_id)})
+                return
             if parsed.path == "/api/library/refresh-tmdb":
-                self._json(tmdb.refresh_library())
+                self._json(tmdb.refresh_library(payload.get("progress_id")))
                 return
             if parsed.path == "/api/library/refresh-musicbrainz":
-                self._json(musicbrainz.refresh_library())
+                self._json(musicbrainz.refresh_library(payload.get("progress_id")))
                 return
             if parsed.path.startswith("/api/library/") and parsed.path.endswith("/favorite"):
                 item_id = unquote(parsed.path[len("/api/library/"):-len("/favorite")]).strip("/")
                 if not item_id:
-                    raise ValueError("Movie ID is required")
+                    raise ValueError("Library item ID is required")
                 favorite = payload.get("favorite")
                 if not isinstance(favorite, bool):
                     raise ValueError("favorite must be a boolean")

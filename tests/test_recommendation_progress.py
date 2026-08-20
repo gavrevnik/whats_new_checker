@@ -24,3 +24,21 @@ class RecommendationProgressTests(unittest.TestCase):
         recommendation_progress.finish("job-test")
         self.assertEqual(recommendation_progress.get("job-test")["processed"], 2)
         self.assertTrue(recommendation_progress.get("job-test")["complete"])
+
+    def test_cancel_keeps_partial_progress_and_survives_early_request(self) -> None:
+        recommendation_progress.cancel("job-cancel-before-start")
+        recommendation_progress.start("job-cancel-before-start", 4)
+        recommendation_progress.advance("job-cancel-before-start")
+        recommendation_progress.finish("job-cancel-before-start")
+
+        current = recommendation_progress.get("job-cancel-before-start")
+        self.assertTrue(current["cancel_requested"])
+        self.assertTrue(current["cancelled"])
+        self.assertTrue(current["complete"])
+        self.assertEqual(current["processed"], 1)
+        self.assertEqual(current["total"], 4)
+
+        recommendation_progress.start("job-cancel-before-start", 2)
+        restarted = recommendation_progress.get("job-cancel-before-start")
+        self.assertFalse(restarted["cancel_requested"])
+        self.assertFalse(restarted["cancelled"])

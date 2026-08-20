@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app import llm, storage
 
@@ -118,7 +118,7 @@ class LlmTests(unittest.TestCase):
              patch.object(llm.tmdb, "get_api_key", return_value=("test-key", "test")), \
              patch.object(llm.tmdb, "resolve_movie", return_value=999), \
              patch.object(llm.tmdb, "movie_details", return_value=details), \
-             patch.object(llm.subprocess, "run", return_value=completed) as run:
+             patch.object(llm, "_run_codex", return_value=completed) as run:
             result = llm.recommend_movies({
                 "prompt":"Научная фантастика", "year_to":"2026", "limit":"1",
                 "progress_id":"llm-movie-job",
@@ -128,14 +128,39 @@ class LlmTests(unittest.TestCase):
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["model"], "test-model")
         self.assertEqual(result["requested"], 1)
-        self.assertIn("Научная фантастика", run.call_args.kwargs["input"])
-        self.assertIn("Верни не более 1", run.call_args.kwargs["input"])
-        command = run.call_args.args[0]
-        self.assertEqual(command[command.index("--model") + 1], "test-model")
-        self.assertEqual(command[command.index("--schema") + 1], str(llm.SCHEMA_PATH))
+        self.assertEqual(result["raw_response"], completed.stdout.strip())
+        prompt, model, schema_path, progress_id = run.call_args.args
+        self.assertIn("Научная фантастика", prompt)
+        self.assertIn("Верни не более 1", prompt)
+        self.assertEqual(model, "test-model")
+        self.assertEqual(schema_path, llm.SCHEMA_PATH)
+        self.assertEqual(progress_id, "llm-movie-job")
         progress = llm.recommendation_progress.get("llm-movie-job")
         self.assertEqual([stage["id"] for stage in progress["stages"]], ["llm-request", "llm-movie-details"])
         self.assertTrue(progress["complete"])
+
+    def test_codex_process_is_terminated_after_cancel_request(self) -> None:
+        process = MagicMock()
+        process.poll.return_value = None
+        with patch.object(llm.subprocess, "Popen", return_value=process), \
+             patch.object(llm.recommendation_progress, "is_cancelled", return_value=True):
+            result = llm._run_codex("prompt", "model", llm.SCHEMA_PATH, "cancel-job")
+        self.assertIsNone(result)
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=2)
+        process.kill.assert_not_called()
+
+    def test_codex_runner_receives_prompt_larger_than_pipe_buffer(self) -> None:
+        runner = Path(self.temp.name) / "read_prompt.py"
+        runner.write_text("import sys\nprint(len(sys.stdin.read()))\n", encoding="utf-8")
+        prompt = "x" * 50_000
+        with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
+             patch.object(llm, "RUNNER", runner), \
+             patch.object(llm.recommendation_progress, "is_cancelled", return_value=False):
+            result = llm._run_codex(prompt, "test-model", llm.SCHEMA_PATH, "large-prompt-job")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "50000")
 
     def test_recommendation_skips_movies_that_fail_verified_filters(self) -> None:
         response = {"movies":[{
@@ -150,7 +175,7 @@ class LlmTests(unittest.TestCase):
              patch.object(llm.tmdb, "get_api_key", return_value=("test-key", "test")), \
              patch.object(llm.tmdb, "resolve_movie", return_value=1000), \
              patch.object(llm.tmdb, "movie_details", return_value=details), \
-             patch.object(llm.subprocess, "run", return_value=completed):
+             patch.object(llm, "_run_codex", return_value=completed):
             result = llm.recommend_movies({"year_to":"2026", "limit":"1", "min_runtime":"100"})
         self.assertEqual(result["items"], [])
         self.assertIn("длительность меньше 100", result["errors"][0]["error"])
@@ -212,7 +237,7 @@ class LlmTests(unittest.TestCase):
         with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
              patch.object(llm.tmdb, "get_api_key", return_value=("test-key", "test")), \
              patch.object(llm.tmdb, "resolve_movie", side_effect=llm.tmdb.TmdbError("TMDB: HTTP 429")), \
-             patch.object(llm.subprocess, "run", return_value=completed):
+             patch.object(llm, "_run_codex", return_value=completed):
             result = llm.recommend_movies({"year_to":"2026", "limit":"1"})
         self.assertEqual(result["items"], [])
         self.assertIn("TMDB", result["errors"][0]["error"])
@@ -221,7 +246,7 @@ class LlmTests(unittest.TestCase):
     def test_rejects_unstructured_model_response(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "1. Тест (Test)", "")
         with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
-             patch.object(llm.subprocess, "run", return_value=completed):
+             patch.object(llm, "_run_codex", return_value=completed):
             with self.assertRaises(llm.LlmError):
                 llm.recommend_movies({"year_to":"2026"})
 
@@ -229,7 +254,7 @@ class LlmTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, '{"movies":[]}', "")
         with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
              patch.object(llm.tmdb, "get_api_key", return_value=("test-key", "test")), \
-             patch.object(llm.subprocess, "run", return_value=completed):
+             patch.object(llm, "_run_codex", return_value=completed):
             result = llm.recommend_movies({"year_to":"2026", "limit":"3"})
         self.assertEqual(result["items"], [])
         self.assertEqual(result["errors"], [])
@@ -272,15 +297,15 @@ class LlmTests(unittest.TestCase):
         }
         with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
              patch.object(llm, "get_model", return_value="test-model"), \
-             patch.object(llm.subprocess, "run", return_value=completed) as run, \
+             patch.object(llm, "_run_codex", return_value=completed) as run, \
              patch.object(llm.musicbrainz, "search_album", return_value=details), \
              patch.object(llm.musicbrainz, "album_details", return_value=details) as album_details, \
              patch.object(llm.listenbrainz, "enrich_albums", side_effect=lambda items: items) as popularity:
             result = llm.recommend_albums({"year_from":"2023", "year_to":"2026", "limit":"1"})
         self.assertEqual(result["items"][0]["release_group_mbid"], "rg-1")
         self.assertEqual(result["items"][0]["notes"], "Подходит")
-        command = run.call_args.args[0]
-        self.assertEqual(command[command.index("--schema") + 1], str(llm.ALBUM_SCHEMA_PATH))
+        self.assertEqual(result["raw_response"], completed.stdout.strip())
+        self.assertEqual(run.call_args.args[2], llm.ALBUM_SCHEMA_PATH)
         album_details.assert_called_once_with("rg-1", fetch_popularity=False)
         popularity.assert_called_once_with(result["items"])
 
@@ -292,12 +317,13 @@ class LlmTests(unittest.TestCase):
         artist = storage.add_music_artist({"content_type":"music", "name":"Portishead", "mbid":"artist-portishead"})
         storage.trash_entity({"entity_type":"music_artist", "entity_id":artist["id"]})
 
-        movie_prompt = llm.build_people_prompt({"content_type":"movie", "prompt":"Необычные актёры"})
+        movie_prompt = llm.build_people_prompt({"content_type":"movie", "prompt":"Необычные актёры", "limit":"5"})
         music_prompt = llm.build_people_prompt({"content_type":"music", "prompt":"Мрачный трип-хоп"})
 
         self.assertIn("Дэвид Финчер (David Fincher)", movie_prompt)
         self.assertIn("Тильда Суинтон (Tilda Swinton)", movie_prompt)
         self.assertIn("включая корзину", movie_prompt)
+        self.assertIn("не более 5", movie_prompt)
         self.assertIn("Portishead", music_prompt)
         self.assertIn("Мрачный трип-хоп", music_prompt)
 
@@ -313,16 +339,16 @@ class LlmTests(unittest.TestCase):
         }
         with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
              patch.object(llm, "get_model", return_value="test-model"), \
-             patch.object(llm.subprocess, "run", return_value=completed) as run, \
+             patch.object(llm, "_run_codex", return_value=completed) as run, \
              patch.object(llm.tmdb, "resolve_person_input", return_value=details) as resolve:
             result = llm.recommend_people({
-                "content_type":"movie", "prompt":"Женщины-режиссёры", "progress_id":"people-movie-job",
+                "content_type":"movie", "prompt":"Женщины-режиссёры", "limit":"5", "progress_id":"people-movie-job",
             })
         self.assertEqual(result["items"][0]["tmdb_id"], 100)
         self.assertEqual(result["items"][0]["notes"], "Подходит по авторскому стилю")
+        self.assertEqual(result["requested"], 5)
         resolve.assert_called_once()
-        command = run.call_args.args[0]
-        self.assertEqual(command[command.index("--schema") + 1], str(llm.PERSON_SCHEMA_PATH))
+        self.assertEqual(run.call_args.args[2], llm.PERSON_SCHEMA_PATH)
         progress = llm.recommendation_progress.get("people-movie-job")
         self.assertEqual([stage["id"] for stage in progress["stages"]], ["llm-request", "tmdb-people"])
         self.assertTrue(progress["complete"])
@@ -338,7 +364,7 @@ class LlmTests(unittest.TestCase):
             "name_ru":"Massive Attack", "mbid":"artist-massive-attack", "artist_type":"Group",
         }
         with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
-             patch.object(llm.subprocess, "run", return_value=completed), \
+             patch.object(llm, "_run_codex", return_value=completed), \
              patch.object(llm.musicbrainz, "resolve_artist_input", return_value=details) as resolve:
             result = llm.recommend_people({"content_type":"music", "prompt":"Трип-хоп"})
         self.assertEqual(result["items"][0]["mbid"], "artist-massive-attack")

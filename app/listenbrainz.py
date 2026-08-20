@@ -69,12 +69,15 @@ def release_group_popularity(
     continue_on_error: bool = False,
     on_batch: Callable[[], None] | None = None,
     on_error: Callable[[ListenBrainzError], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, int | None]:
     mbids = list(dict.fromkeys(str(value or "").strip() for value in release_group_mbids))
     mbids = [value for value in mbids if value]
     results: dict[str, int | None] = {}
     token, _ = get_user_token()
     for batch in _chunks(mbids, BATCH_SIZE):
+        if should_cancel and should_cancel():
+            break
         body = json.dumps({"release_group_mbids": batch}).encode("utf-8")
         headers = {
             "Accept": "application/json",
@@ -139,12 +142,14 @@ def enrich_albums(
     continue_on_error: bool = False,
     on_batch: Callable[[], None] | None = None,
     on_error: Callable[[ListenBrainzError], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     counts = release_group_popularity(
         (item.get("release_group_mbid") or item.get("mbid") or "" for item in items),
         continue_on_error=continue_on_error,
         on_batch=on_batch,
         on_error=on_error,
+        should_cancel=should_cancel,
     )
     for item in items:
         mbid = str(item.get("release_group_mbid") or item.get("mbid") or "")

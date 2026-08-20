@@ -442,20 +442,37 @@ def person_details(tmdb_id: int, api_key: str | None = None) -> dict[str, Any]:
     if not original_name:
         raise TmdbError(f"TMDB person not found: {tmdb_id}")
     localized_name = str(localized.get("name") or "").strip()
-    return {
+    profile_path = str(details.get("profile_path") or "")
+    profile_url = artwork.person_profile_url(profile_path)
+    payload = {
         "tmdb_id": int(details["id"]),
         "name_original": original_name,
         "name_ru": localized_name if re.search(r"[А-Яа-яЁё]", localized_name) else (_cyrillic_alias(aliases) or original_name),
+        "profile_path": profile_path,
+        "profile_url": profile_url,
         "details_json": {
             "also_known_as": aliases,
             "biography": str(details.get("biography") or ""),
             "birthday": str(details.get("birthday") or ""),
             "deathday": str(details.get("deathday") or ""),
             "place_of_birth": str(details.get("place_of_birth") or ""),
-            "profile_url": f"https://image.tmdb.org/t/p/w300{details['profile_path']}" if details.get("profile_path") else "",
+            "profile_path": profile_path,
+            "profile_url": profile_url,
+            "profile_checked": True,
             "known_for_department": str(details.get("known_for_department") or ""),
         },
     }
+    if profile_path:
+        try:
+            payload["profile_local_path"] = artwork.cache_person_profile(
+                payload["tmdb_id"], profile_path, profile_url,
+            )
+        except artwork.ArtworkError as error:
+            payload["profile_local_path"] = ""
+            payload["provider_warnings"] = [{"provider": "tmdb-images", "message": str(error)}]
+    else:
+        payload["profile_local_path"] = ""
+    return payload
 
 
 def resolve_person(query: str, role: str, api_key: str) -> int:
@@ -505,12 +522,21 @@ def _person_matches_target(target: dict[str, Any], details: dict[str, Any]) -> b
 
 def _fetch_person_target(target: dict[str, Any], api_key: str) -> tuple[str, dict[str, Any]]:
     tmdb_id = target.get("tmdb_id") or target.get("external_id")
-    details = person_details(int(tmdb_id), api_key) if str(tmdb_id).isdigit() else None
+    if str(tmdb_id).isdigit():
+        return str(target["id"]), person_details(int(tmdb_id), api_key)
     query = target.get("name_original") or target.get("name_ru") or ""
     resolved_id = resolve_person(query, target["role"], api_key)
-    if details is None or not _person_matches_target(target, details) or int(details["tmdb_id"]) != resolved_id:
-        details = person_details(resolved_id, api_key)
-    return str(target["id"]), details
+    return str(target["id"]), person_details(resolved_id, api_key)
+
+
+def _person_needs_refresh(target: dict[str, Any]) -> bool:
+    if not str(target.get("tmdb_id") or target.get("external_id") or "").strip():
+        return True
+    if not str(target.get("tmdb_updated_at") or "").strip():
+        return True
+    return bool(target.get("profile_path") or target.get("profile_url")) and not artwork.is_cached(
+        target.get("profile_local_path")
+    )
 
 
 def refresh_person(person_id: str) -> dict[str, Any]:
@@ -528,7 +554,10 @@ def refresh_people() -> dict[str, Any]:
     api_key, _ = get_api_key()
     if not api_key:
         raise TmdbError("TMDB_API_KEY is not configured")
-    targets = storage.list_interests("movie")
+    targets = [
+        target for target in storage.list_interests("movie")
+        if _person_needs_refresh(target)
+    ]
 
     errors: list[dict[str, str]] = []
     updated = 0
@@ -709,7 +738,7 @@ def _refresh_movie_target(target: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def refresh_library() -> dict[str, Any]:
+def refresh_library(progress_id: object = None) -> dict[str, Any]:
     targets = [
         target for target in storage.movie_refresh_targets()
         if _needs_movie_refresh(target)
@@ -721,19 +750,33 @@ def refresh_library() -> dict[str, Any]:
     updated: list[str] = []
     errors: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
+    recommendation_progress.start(
+        progress_id, len(targets), stage_id="library-refresh",
+        label="Актуализация карточек фильмов", unit="фильмов",
+    )
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(fetch, target): target for target in targets}
         for future in as_completed(futures):
             target = futures[future]
+            if future.cancelled():
+                continue
             try:
                 item_id, item = future.result()
                 updated.append(item_id)
                 warnings.extend(item.get("provider_warnings", []))
             except Exception as error:
                 errors.append({"id": str(target["id"]), "title": str(target["title_original"]), "error": str(error)})
+            finally:
+                recommendation_progress.advance(progress_id, "library-refresh")
+            if recommendation_progress.is_cancelled(progress_id):
+                for pending in futures:
+                    if not pending.running() and not pending.done():
+                        pending.cancel()
+    recommendation_progress.finish(progress_id)
     return {
         "total": len(targets), "updated": len(updated), "failed": len(errors),
         "errors": errors, "provider_warnings": warnings,
+        "cancelled": recommendation_progress.is_cancelled(progress_id),
     }
 
 
@@ -793,7 +836,7 @@ def recommend_movies(filters: dict[str, Any]) -> dict[str, Any]:
         directors = [row for row in directors if row["id"] in selected_director_ids]
     interests = [*actors, *directors]
     if not interests:
-        raise TmdbError("Select at least one actor or director")
+        raise TmdbError("Нужно выбрать хотя бы одного актёра или режиссёра")
     progress_id = filters.get("progress_id")
     recommendation_progress.start(
         progress_id, len(interests), stage_id="tmdb-people",
@@ -815,6 +858,8 @@ def recommend_movies(filters: dict[str, Any]) -> dict[str, Any]:
     candidates: dict[int, dict[str, Any]] = {}
     filtered_candidates: dict[int, dict[str, Any]] = {}
     for person in interests:
+        if recommendation_progress.is_cancelled(progress_id):
+            break
         try:
             credits = _get(f"/person/{person['external_id']}/movie_credits", {"language": "ru-RU"}, api_key)
             source_rows = credits.get("cast", []) if person["role"] == "actor" else [
@@ -857,6 +902,8 @@ def recommend_movies(filters: dict[str, Any]) -> dict[str, Any]:
     errors: list[dict[str, str]] = []
     try:
         for row in ranked:
+            if recommendation_progress.is_cancelled(progress_id):
+                break
             try:
                 movie_id = str(row["id"])
                 year = str(row.get("release_date") or "")[:4]
@@ -915,4 +962,7 @@ def recommend_movies(filters: dict[str, Any]) -> dict[str, Any]:
     finally:
         recommendation_progress.finish_stage(progress_id, "movie-details")
         recommendation_progress.finish(progress_id)
-    return {"items": results, "filtered_items": list(filtered_candidates.values()), "errors": errors}
+    return {
+        "items": results, "filtered_items": list(filtered_candidates.values()), "errors": errors,
+        "cancelled": recommendation_progress.is_cancelled(progress_id),
+    }

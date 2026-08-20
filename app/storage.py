@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS content_items (
     title_original TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'backlog' CHECK (status IN ('backlog', 'consumed', 'dismissed')),
     reaction TEXT NOT NULL DEFAULT '' CHECK (reaction IN ('', 'like', 'dislike')),
+    planned_soon INTEGER NOT NULL DEFAULT 0 CHECK (planned_soon IN (0, 1)),
     source TEXT NOT NULL DEFAULT 'manual',
     source_url TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
@@ -138,6 +139,9 @@ CREATE TABLE IF NOT EXISTS people (
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     raw_json TEXT NOT NULL DEFAULT '{}',
     details_json TEXT NOT NULL DEFAULT '{}',
+    profile_path TEXT NOT NULL DEFAULT '',
+    profile_url TEXT NOT NULL DEFAULT '',
+    profile_local_path TEXT NOT NULL DEFAULT '',
     tmdb_updated_at TEXT
 );
 
@@ -254,6 +258,9 @@ def initialize_database(path: Path | None = None) -> None:
         needs_artwork_backfill = not connection.execute(
             "SELECT 1 FROM schema_version WHERE version = 9"
         ).fetchone()
+        needs_person_artwork_backfill = not connection.execute(
+            "SELECT 1 FROM schema_version WHERE version = 10"
+        ).fetchone()
         trash_sql_row = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'trash_entries'"
         ).fetchone()
@@ -281,6 +288,7 @@ def initialize_database(path: Path | None = None) -> None:
         migrations = {
             "content_items": {
                 "raw_json": "TEXT NOT NULL DEFAULT '{}'",
+                "planned_soon": "INTEGER NOT NULL DEFAULT 0 CHECK (planned_soon IN (0, 1))",
             },
             "movies": {
                 "kinopoisk_rating": "REAL",
@@ -298,6 +306,9 @@ def initialize_database(path: Path | None = None) -> None:
             "people": {
                 "raw_json": "TEXT NOT NULL DEFAULT '{}'",
                 "details_json": "TEXT NOT NULL DEFAULT '{}'",
+                "profile_path": "TEXT NOT NULL DEFAULT ''",
+                "profile_url": "TEXT NOT NULL DEFAULT ''",
+                "profile_local_path": "TEXT NOT NULL DEFAULT ''",
                 "tmdb_updated_at": "TEXT",
             },
             "albums": {
@@ -337,6 +348,27 @@ def initialize_database(path: Path | None = None) -> None:
                     "UPDATE movies SET poster_path = ?, poster_url = ? WHERE content_id = ?",
                     (poster_path, poster_url, row["content_id"]),
                 )
+        if needs_person_artwork_backfill:
+            for row in connection.execute(
+                "SELECT id, details_json, profile_path, profile_url FROM people"
+            ).fetchall():
+                try:
+                    details = json.loads(row["details_json"] or "{}")
+                except json.JSONDecodeError:
+                    details = {}
+                if not isinstance(details, dict):
+                    continue
+                profile_url = str(row["profile_url"] or details.get("profile_url") or "")
+                if "image.tmdb.org/t/p/" in profile_url:
+                    profile_url = re.sub(r"(/t/p/)[^/]+/", r"\g<1>w185/", profile_url, count=1)
+                profile_path = str(row["profile_path"] or details.get("profile_path") or "")
+                match = re.search(r"/t/p/[^/]+(/[^?#]+)", profile_url)
+                if not profile_path and match:
+                    profile_path = match.group(1)
+                connection.execute(
+                    "UPDATE people SET profile_path = ?, profile_url = ? WHERE id = ?",
+                    (profile_path, profile_url, row["id"]),
+                )
         connection.execute(
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (1, ?)", (_now(),)
         )
@@ -365,6 +397,9 @@ def initialize_database(path: Path | None = None) -> None:
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (9, ?)", (_now(),)
         )
         connection.execute(
+            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (10, ?)", (_now(),)
+        )
+        connection.execute(
             "INSERT OR IGNORE INTO content_types(code, name_ru, enabled) VALUES ('movie', 'Фильмы', 1)"
         )
         connection.execute(
@@ -378,6 +413,7 @@ def _movie_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
     query = f"""
         SELECT
             i.id, i.content_type, i.title_ru, i.title_original, i.status, i.reaction,
+            COALESCE(i.planned_soon, 0) AS planned_soon,
             i.source, i.source_url AS url, i.notes, COALESCE(i.raw_json, '{{}}') AS raw_json,
             i.metadata_json, i.added_at,
             COALESCE(i.consumed_at, '') AS consumed_at, i.updated_at,
@@ -471,6 +507,7 @@ def _movie_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
         result["poster_url"] = result.pop("stored_poster_url", "")
         result["poster_local_path"] = result.pop("stored_poster_local_path", "")
         result["favorite"] = bool(result.get("favorite"))
+        result["planned_soon"] = bool(result.get("planned_soon"))
         imdb_id = str(result.get("imdb_id") or "")
         tmdb_id = str(result.get("tmdb_id") or "")
         kinopoisk_id = str(result.get("kinopoisk_id") or "")
@@ -492,6 +529,7 @@ def _album_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
     query = f"""
         SELECT
             i.id, i.content_type, i.title_ru, i.title_original, i.status, i.reaction,
+            COALESCE(i.planned_soon, 0) AS planned_soon,
             i.source, i.source_url AS url, i.notes, COALESCE(i.raw_json, '{{}}') AS raw_json,
             i.metadata_json, i.added_at, COALESCE(i.consumed_at, '') AS consumed_at, i.updated_at,
             COALESCE(a.release_group_mbid, '') AS release_group_mbid,
@@ -517,6 +555,7 @@ def _album_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
             COALESCE(a.details_json, '{{}}') AS details_json,
             COALESCE(a.musicbrainz_updated_at, '') AS musicbrainz_updated_at,
             COALESCE(a.cover_art_updated_at, '') AS cover_art_updated_at,
+            EXISTS(SELECT 1 FROM favorite_movies f WHERE f.content_id = i.id) AS favorite,
             COALESCE((
                 SELECT group_concat(display_name, '; ')
                 FROM (
@@ -565,7 +604,8 @@ def _album_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
         mbid = str(result.get("release_group_mbid") or "")
         result["musicbrainz_link"] = f"https://musicbrainz.org/release-group/{mbid}" if mbid else ""
         result["external_link"] = result["musicbrainz_link"] or str(result.get("url") or "")
-        result["favorite"] = False
+        result["favorite"] = bool(result.get("favorite"))
+        result["planned_soon"] = bool(result.get("planned_soon"))
     return results
 
 
@@ -614,8 +654,10 @@ def get_item(item_id: str) -> dict[str, Any]:
 def set_favorite(item_id: str, favorite: bool) -> dict[str, Any]:
     initialize_database()
     with _lock, connect() as connection:
-        if not connection.execute("SELECT 1 FROM movies WHERE content_id = ?", (item_id,)).fetchone():
-            raise StorageError("Movie not found")
+        if not connection.execute(
+            "SELECT 1 FROM content_items WHERE id = ? AND content_type IN ('movie', 'music')", (item_id,)
+        ).fetchone():
+            raise StorageError("Library item not found")
         if favorite:
             connection.execute(
                 "INSERT INTO favorite_movies(content_id, added_at) VALUES (?, ?) "
@@ -650,6 +692,9 @@ def list_interests(
         SELECT p.id, ir.content_type, ir.role, p.name_original, p.name_ru,
                'tmdb' AS provider, COALESCE(p.tmdb_id, '') AS external_id,
                COALESCE(p.tmdb_id, '') AS tmdb_id, p.active, ir.notes,
+               COALESCE(p.profile_path, '') AS profile_path,
+               COALESCE(p.profile_url, '') AS profile_url,
+               COALESCE(p.profile_local_path, '') AS profile_local_path,
                COALESCE(p.raw_json, '{{}}') AS raw_json,
                COALESCE(p.details_json, '{{}}') AS details_json,
                COALESCE(p.tmdb_updated_at, '') AS tmdb_updated_at
@@ -684,6 +729,16 @@ def list_music_artists(include_trashed: bool = False) -> list[dict[str, Any]]:
     """
     with connect() as connection:
         return [dict(row) for row in connection.execute(query).fetchall()]
+
+
+def get_interest_person(person_id: str) -> dict[str, Any]:
+    person = next(
+        (row for row in list_interests("movie", include_trashed=True) if str(row["id"]) == str(person_id)),
+        None,
+    )
+    if not person:
+        raise StorageError("Person not found")
+    return person
 
 
 def list_trash() -> list[dict[str, Any]]:
@@ -803,7 +858,10 @@ def empty_trash() -> dict[str, Any]:
             "JOIN movies m ON m.content_id = t.entity_id WHERE t.entity_type = 'movie' "
             "UNION "
             "SELECT a.cover_path AS path FROM trash_entries t "
-            "JOIN albums a ON a.content_id = t.entity_id WHERE t.entity_type = 'album'"
+            "JOIN albums a ON a.content_id = t.entity_id WHERE t.entity_type = 'album' "
+            "UNION "
+            "SELECT p.profile_local_path AS path FROM trash_entries t "
+            "JOIN people p ON p.id = t.entity_id WHERE t.entity_type = 'person'"
         ).fetchall()
         artwork_paths = {str(row["path"] or "").strip() for row in artwork_rows} - {""}
 
@@ -849,7 +907,8 @@ def empty_trash() -> dict[str, Any]:
 
         referenced_rows = connection.execute(
             "SELECT poster_local_path AS path FROM movies WHERE poster_local_path <> '' "
-            "UNION SELECT cover_path AS path FROM albums WHERE cover_path <> ''"
+            "UNION SELECT cover_path AS path FROM albums WHERE cover_path <> '' "
+            "UNION SELECT profile_local_path AS path FROM people WHERE profile_local_path <> ''"
         ).fetchall()
         referenced_paths = {str(row["path"] or "").strip() for row in referenced_rows}
 
@@ -878,6 +937,10 @@ def add_interest_person(person: dict[str, Any]) -> dict[str, Any]:
         raise StorageError("Person name is required")
     tmdb_raw = person.get("tmdb_id") or person.get("external_id")
     tmdb_id = int(tmdb_raw) if str(tmdb_raw).isdigit() else None
+    details_json = _json(person.get("details_json") or {}, "{}")
+    profile_path = str(person.get("profile_path") or "")
+    profile_url = str(person.get("profile_url") or "")
+    profile_local_path = str(person.get("profile_local_path") or "")
     raw_json = _json(
         person.get("raw_data") or {
             key: person.get(key) for key in ("role", "tmdb_id", "name_original", "name_ru")
@@ -900,13 +963,26 @@ def add_interest_person(person: dict[str, Any]) -> dict[str, Any]:
             connection.execute(
                 "UPDATE people SET active = 1, tmdb_id = COALESCE(tmdb_id, ?), "
                 "name_original = COALESCE(NULLIF(name_original, ''), ?), name_ru = COALESCE(NULLIF(name_ru, ''), ?), "
-                "raw_json = ? WHERE id = ?",
-                (tmdb_id, name_original, name_ru, raw_json, person_id),
+                "raw_json = ?, details_json = CASE WHEN ? <> '{}' THEN ? ELSE details_json END, "
+                "profile_path = COALESCE(NULLIF(?, ''), profile_path), "
+                "profile_url = COALESCE(NULLIF(?, ''), profile_url), "
+                "profile_local_path = COALESCE(NULLIF(?, ''), profile_local_path), "
+                "tmdb_updated_at = CASE WHEN ? IS NOT NULL THEN ? ELSE tmdb_updated_at END WHERE id = ?",
+                (
+                    tmdb_id, name_original, name_ru, raw_json, details_json, details_json,
+                    profile_path, profile_url, profile_local_path,
+                    tmdb_id, _now(), person_id,
+                ),
             )
         else:
             connection.execute(
-                "INSERT INTO people(id, name_original, name_ru, tmdb_id, active, raw_json) VALUES (?, ?, ?, ?, 1, ?)",
-                (person_id, name_original, name_ru, tmdb_id, raw_json),
+                "INSERT INTO people(id, name_original, name_ru, tmdb_id, active, raw_json, details_json, "
+                "profile_path, profile_url, profile_local_path, tmdb_updated_at) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                (
+                    person_id, name_original, name_ru, tmdb_id, raw_json, details_json,
+                    profile_path, profile_url, profile_local_path, _now() if tmdb_id else None,
+                ),
             )
         if connection.execute(
             "SELECT 1 FROM interest_roles WHERE person_id = ? AND content_type = 'movie' AND role = ?",
@@ -1046,10 +1122,15 @@ def update_interest_person(person_id: str, details: dict[str, Any]) -> dict[str,
         connection.execute(
             "UPDATE people SET name_original = COALESCE(NULLIF(?, ''), name_original), "
             "name_ru = COALESCE(NULLIF(?, ''), name_ru), tmdb_id = COALESCE(?, tmdb_id), "
-            "details_json = ?, tmdb_updated_at = ? WHERE id = ?",
+            "details_json = ?, profile_path = COALESCE(NULLIF(?, ''), profile_path), "
+            "profile_url = COALESCE(NULLIF(?, ''), profile_url), "
+            "profile_local_path = COALESCE(NULLIF(?, ''), profile_local_path), "
+            "tmdb_updated_at = ? WHERE id = ?",
             (
                 str(details.get("name_original") or ""), str(details.get("name_ru") or ""), tmdb_id,
-                _json(details.get("details_json") or {}, "{}"), _now(), person_id,
+                _json(details.get("details_json") or {}, "{}"),
+                str(details.get("profile_path") or ""), str(details.get("profile_url") or ""),
+                str(details.get("profile_local_path") or ""), _now(), person_id,
             ),
         )
     return next(row for row in list_interests("movie") if row["id"] == person_id)
@@ -1422,26 +1503,34 @@ def add_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def update_item(item_id: str, changes: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"status", "reaction", "notes"}
+    allowed = {"status", "reaction", "notes", "planned_soon"}
     changes = {key: value for key, value in changes.items() if key in allowed}
     if not changes:
         raise StorageError("No supported fields to update")
     _validate(changes, partial=True)
     initialize_database()
     with _lock, connect() as connection:
-        row = connection.execute("SELECT status, reaction, notes, consumed_at FROM content_items WHERE id = ?", (item_id,)).fetchone()
+        row = connection.execute(
+            "SELECT status, reaction, notes, planned_soon, consumed_at FROM content_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
         if not row:
             raise StorageError("Item not found")
         status = str(changes.get("status", row["status"]))
         reaction = str(changes.get("reaction", row["reaction"]) or "")
+        planned_raw = changes.get("planned_soon", row["planned_soon"])
+        planned_soon = int(planned_raw in (True, 1, "1"))
         consumed_at = row["consumed_at"]
         if status == "consumed" and not consumed_at:
             consumed_at = _now()
+        if status == "consumed":
+            planned_soon = 0
         if status == "backlog":
             consumed_at, reaction = None, ""
         connection.execute(
-            "UPDATE content_items SET status = ?, reaction = ?, notes = ?, consumed_at = ?, updated_at = ? WHERE id = ?",
-            (status, reaction, str(changes.get("notes", row["notes"])), consumed_at, _now(), item_id),
+            "UPDATE content_items SET status = ?, reaction = ?, notes = ?, planned_soon = ?, "
+            "consumed_at = ?, updated_at = ? WHERE id = ?",
+            (status, reaction, str(changes.get("notes", row["notes"])), planned_soon, consumed_at, _now(), item_id),
         )
     return get_item(item_id)
 
@@ -1678,6 +1767,22 @@ def update_artwork_path(item_id: str, content_type: str, relative_path: str) -> 
     return get_item(item_id)
 
 
+def update_person_artwork_path(
+    person_id: str, relative_path: str, profile_path: str = "", profile_url: str = "",
+) -> dict[str, Any]:
+    initialize_database()
+    with _lock, connect() as connection:
+        cursor = connection.execute(
+            "UPDATE people SET profile_local_path = ?, "
+            "profile_path = COALESCE(NULLIF(?, ''), profile_path), "
+            "profile_url = COALESCE(NULLIF(?, ''), profile_url) WHERE id = ?",
+            (str(relative_path or ""), str(profile_path or ""), str(profile_url or ""), person_id),
+        )
+        if not cursor.rowcount:
+            raise StorageError("Person not found")
+    return get_interest_person(person_id)
+
+
 def update_album_popularity(counts: dict[str, int | None]) -> int:
     initialize_database()
     refreshed_at = _now()
@@ -1697,6 +1802,7 @@ def artist_refresh_targets() -> list[dict[str, Any]]:
     return [
         {key: row.get(key) for key in ("id", "name_original", "name_ru", "mbid")}
         for row in list_music_artists()
+        if not str(row.get("mbid") or row.get("external_id") or "").strip()
     ]
 
 

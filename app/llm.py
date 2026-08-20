@@ -4,6 +4,8 @@ import json
 import os
 import random
 import subprocess
+import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
@@ -29,6 +31,44 @@ Markdown, add prose outside the JSON, or change the field names.
 
 class LlmError(RuntimeError):
     pass
+
+
+def _run_codex(
+    prompt: str, model: str, schema_path: Path, progress_id: object,
+) -> subprocess.CompletedProcess[str] | None:
+    command = [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(schema_path)]
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as input_stream, \
+         tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output_stream, \
+         tempfile.TemporaryFile(mode="w+", encoding="utf-8") as error_stream:
+        input_stream.write(prompt)
+        input_stream.seek(0)
+        try:
+            process = subprocess.Popen(
+                command, stdin=input_stream, stdout=output_stream, stderr=error_stream,
+                text=True, cwd=ROOT,
+            )
+        except OSError as error:
+            raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
+        deadline = time.monotonic() + 300
+        while process.poll() is None:
+            if recommendation_progress.is_cancelled(progress_id):
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                return None
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait()
+                raise LlmError("Codex не успел ответить за 5 минут")
+            time.sleep(0.25)
+        output_stream.seek(0)
+        error_stream.seek(0)
+        return subprocess.CompletedProcess(
+            command, process.returncode, output_stream.read(), error_stream.read(),
+        )
 
 
 def get_model() -> str:
@@ -294,6 +334,8 @@ def _enrich_movies(
 
     eligible: list[tuple[int, dict[str, Any]]] = []
     for index, candidate in enumerate(candidates):
+        if recommendation_progress.is_cancelled(progress_id):
+            break
         label = f"{candidate['title_ru']} ({candidate['title_original']}, {candidate['year']})"
         if _known_title(candidate, known_titles):
             errors.append({"title": label, "error": "уже есть в библиотеке или корзине"})
@@ -304,6 +346,8 @@ def _enrich_movies(
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(_enrich_candidate, candidate, api_key): (index, candidate) for index, candidate in eligible}
         for future in as_completed(futures):
+            if future.cancelled():
+                continue
             index, candidate = futures[future]
             label = f"{candidate['title_ru']} ({candidate['title_original']}, {candidate['year']})"
             try:
@@ -323,6 +367,10 @@ def _enrich_movies(
                 filtered_items.append({"item": _movie_candidate_payload(candidate), "reason": reason})
             finally:
                 recommendation_progress.advance(progress_id, "llm-movie-details")
+            if recommendation_progress.is_cancelled(progress_id):
+                for pending in futures:
+                    if not pending.running() and not pending.done():
+                        pending.cancel()
 
     items: list[dict[str, Any]] = []
     seen_tmdb_ids: set[str] = set()
@@ -347,20 +395,12 @@ def recommend_movies(payload: dict[str, Any]) -> dict[str, Any]:
         if not VENV_PYTHON.exists():
             raise LlmError("Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt")
         model = get_model()
-        try:
-            completed = subprocess.run(
-                [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(SCHEMA_PATH)],
-                input=prompt,
-                text=True,
-                capture_output=True,
-                cwd=ROOT,
-                timeout=300,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise LlmError("Codex не успел ответить за 5 минут") from error
-        except OSError as error:
-            raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
+        completed = _run_codex(prompt, model, SCHEMA_PATH, progress_id)
+        if completed is None:
+            return {
+                "items": [], "filtered_items": [], "errors": [], "model": model,
+                "requested": 0, "received": 0, "raw_response": "", "cancelled": True,
+            }
         if completed.returncode != 0:
             message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
             raise LlmError(f"Codex SDK: {message[-1200:]}")
@@ -381,6 +421,8 @@ def recommend_movies(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "items": items, "filtered_items": filtered_items, "errors": errors,
             "model": model, "requested": requested, "received": len(candidates),
+            "raw_response": answer,
+            "cancelled": recommendation_progress.is_cancelled(progress_id),
         }
     finally:
         recommendation_progress.finish(progress_id)
@@ -488,20 +530,20 @@ def recommend_albums(payload: dict[str, Any]) -> dict[str, Any]:
                 "Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
             )
         model = get_model()
-        try:
-            completed = subprocess.run(
-                [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(ALBUM_SCHEMA_PATH)],
-                input=prompt, text=True, capture_output=True, cwd=ROOT, timeout=300, check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise LlmError("Codex не успел ответить за 5 минут") from error
-        except OSError as error:
-            raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
+        completed = _run_codex(prompt, model, ALBUM_SCHEMA_PATH, progress_id)
+        if completed is None:
+            return {
+                "items": [], "filtered_items": [], "errors": [], "model": model,
+                "requested": 0, "received": 0, "provider_warnings": [], "raw_response": "", "cancelled": True,
+            }
         if completed.returncode != 0:
             message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
             raise LlmError(f"Codex SDK: {message[-1200:]}")
         recommendation_progress.finish_stage(progress_id, "llm-request")
-        candidates = _parse_album_response(completed.stdout.strip())
+        answer = completed.stdout.strip()
+        if not answer:
+            raise LlmError("Codex вернул пустой ответ")
+        candidates = _parse_album_response(answer)
         limit_raw = _optional_number(payload, "limit", 5, 1, 20)
         requested = int(limit_raw) if limit_raw is not None else 10
         selected = candidates[:requested]
@@ -515,6 +557,8 @@ def recommend_albums(payload: dict[str, Any]) -> dict[str, Any]:
         errors: list[dict[str, str]] = []
         seen: set[str] = set()
         for candidate in selected:
+            if recommendation_progress.is_cancelled(progress_id):
+                break
             label = f"{candidate['artist']} — {candidate['title']} ({candidate['year']})"
             normalized = storage._normalized(candidate["title"])
             if normalized in known_titles:
@@ -574,6 +618,7 @@ def recommend_albums(payload: dict[str, Any]) -> dict[str, Any]:
                     listenbrainz.enrich_albums(
                         items,
                         on_batch=lambda: recommendation_progress.advance(progress_id, "llm-listenbrainz"),
+                        should_cancel=lambda: recommendation_progress.is_cancelled(progress_id),
                     )
                 else:
                     listenbrainz.enrich_albums(items)
@@ -591,6 +636,8 @@ def recommend_albums(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "items": items, "filtered_items": filtered_items, "errors": errors, "model": model,
             "requested": requested, "received": len(candidates), "provider_warnings": warnings,
+            "raw_response": answer,
+            "cancelled": recommendation_progress.is_cancelled(progress_id),
         }
     finally:
         recommendation_progress.finish(progress_id)
@@ -613,6 +660,7 @@ def build_people_prompt(payload: dict[str, Any]) -> str:
     user_prompt = str(payload.get("prompt") or "").strip()
     if len(user_prompt) > 8000:
         raise LlmError("Пользовательский промпт слишком длинный")
+    limit = int(_number(payload, "limit", 5, 1, 20))
     existing = storage.list_interests(content_type, include_trashed=True)
     existing_lines = [
         _artist_line(person) if content_type == "music" else _person_line(person)
@@ -637,7 +685,7 @@ def build_people_prompt(payload: dict[str, Any]) -> str:
     user_block = user_prompt or "Дополнительных пожеланий нет — подбери наиболее релевантные рекомендации."
     return "\n\n".join([
         task,
-        "Верни не более 10 наиболее релевантных позиций. Не предлагай никого из уже добавленных списков, "
+        f"Верни не более {limit} наиболее релевантных позиций. Не предлагай никого из уже добавленных списков, "
         "включая объекты в корзине. Не заменяй уже добавленную персону вариантом написания того же имени.",
         f"Свободный запрос пользователя:\n{user_block}",
         _section(
@@ -696,6 +744,7 @@ def recommend_people(payload: dict[str, Any]) -> dict[str, Any]:
     content_type = str(payload.get("content_type") or "movie")
     if content_type not in {"movie", "music"}:
         raise LlmError("Неизвестный тип контента")
+    requested = int(_number(payload, "limit", 5, 1, 20))
     progress_id = payload.get("progress_id")
     recommendation_progress.start(
         progress_id, 1, stage_id="llm-request", label="Codex · запрос к LLM", unit="запросов",
@@ -707,20 +756,17 @@ def recommend_people(payload: dict[str, Any]) -> dict[str, Any]:
                 "Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
             )
         model = get_model()
-        try:
-            completed = subprocess.run(
-                [str(VENV_PYTHON), str(RUNNER), "--model", model, "--schema", str(PERSON_SCHEMA_PATH)],
-                input=prompt, text=True, capture_output=True, cwd=ROOT, timeout=300, check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise LlmError("Codex не успел ответить за 5 минут") from error
-        except OSError as error:
-            raise LlmError(f"Не удалось запустить Codex SDK: {error}") from error
+        completed = _run_codex(prompt, model, PERSON_SCHEMA_PATH, progress_id)
+        if completed is None:
+            return {
+                "items": [], "errors": [], "model": model,
+                "requested": 0, "received": 0, "cancelled": True,
+            }
         if completed.returncode != 0:
             message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
             raise LlmError(f"Codex SDK: {message[-1200:]}")
         recommendation_progress.finish_stage(progress_id, "llm-request")
-        candidates = _parse_people_response(completed.stdout.strip(), content_type)[:10]
+        candidates = _parse_people_response(completed.stdout.strip(), content_type)[:requested]
         provider = "MusicBrainz" if content_type == "music" else "TMDB"
         stage_id = "musicbrainz-people" if content_type == "music" else "tmdb-people"
         recommendation_progress.set_stage(
@@ -739,6 +785,8 @@ def recommend_people(payload: dict[str, Any]) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         for candidate in candidates:
+            if recommendation_progress.is_cancelled(progress_id):
+                break
             label = candidate["name_ru"] or candidate["name_original"]
             candidate_names = _person_name_keys(candidate)
             try:
@@ -775,7 +823,8 @@ def recommend_people(payload: dict[str, Any]) -> dict[str, Any]:
         recommendation_progress.finish_stage(progress_id, stage_id)
         return {
             "items": items, "errors": errors, "model": model,
-            "requested": 10, "received": len(candidates),
+            "requested": requested, "received": len(candidates),
+            "cancelled": recommendation_progress.is_cancelled(progress_id),
         }
     finally:
         recommendation_progress.finish(progress_id)

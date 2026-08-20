@@ -46,11 +46,15 @@ def start(
         return
     with _lock:
         _prune()
+        previous = _jobs.get(key, {})
+        cancel_requested = bool(previous.get("cancel_requested") and not previous.get("complete"))
         initial = _stage(stage_id, label, total, unit)
         _jobs[key] = {
             "found": True, "processed": 0, "total": initial["total"],
             "complete": False, "active_stage": stage_id,
-            "stages": {stage_id: initial}, "warnings": [], "updated_at": time.time(),
+            "stages": {stage_id: initial}, "warnings": [],
+            "cancel_requested": cancel_requested, "cancelled": False,
+            "updated_at": time.time(),
         }
 
 
@@ -98,6 +102,9 @@ def finish_stage(job_id: object, stage_id: str) -> None:
         state = _jobs.get(key)
         if not state or stage_id not in state["stages"]:
             return
+        if state.get("cancel_requested"):
+            state["updated_at"] = time.time()
+            return
         stage = state["stages"][stage_id]
         stage["processed"] = stage["total"]
         stage["complete"] = True
@@ -129,15 +136,45 @@ def finish(job_id: object) -> None:
         state = _jobs.get(key)
         if not state:
             return
-        for stage in state["stages"].values():
-            stage["processed"] = stage["total"]
-            stage["complete"] = True
+        cancelled = bool(state.get("cancel_requested"))
+        if not cancelled:
+            for stage in state["stages"].values():
+                stage["processed"] = stage["total"]
+                stage["complete"] = True
         active = state["stages"].get(state["active_stage"])
         if active:
             state["processed"] = active["processed"]
             state["total"] = active["total"]
         state["complete"] = True
+        state["cancelled"] = cancelled
         state["updated_at"] = time.time()
+
+
+def cancel(job_id: object) -> bool:
+    key = _job_id(job_id)
+    if not key:
+        return False
+    with _lock:
+        state = _jobs.get(key)
+        if not state:
+            initial = _stage("pending", "Подготовка", 1, "шагов")
+            state = {
+                "found": True, "processed": 0, "total": 1, "complete": False,
+                "active_stage": "pending", "stages": {"pending": initial}, "warnings": [],
+                "cancelled": False, "updated_at": time.time(),
+            }
+            _jobs[key] = state
+        state["cancel_requested"] = True
+        state["updated_at"] = time.time()
+    return True
+
+
+def is_cancelled(job_id: object) -> bool:
+    key = _job_id(job_id)
+    if not key:
+        return False
+    with _lock:
+        return bool(_jobs.get(key, {}).get("cancel_requested"))
 
 
 def get(job_id: object) -> dict[str, Any]:
@@ -147,10 +184,12 @@ def get(job_id: object) -> dict[str, Any]:
         if not state:
             return {
                 "found": False, "processed": 0, "total": 0, "complete": False,
-                "stages": [], "warnings": [],
+                "stages": [], "warnings": [], "cancel_requested": False, "cancelled": False,
             }
         return {
             **{field: state[field] for field in ("found", "processed", "total", "complete")},
             "stages": [dict(stage) for stage in state["stages"].values()],
             "warnings": [dict(warning) for warning in state["warnings"]],
+            "cancel_requested": bool(state.get("cancel_requested")),
+            "cancelled": bool(state.get("cancelled")),
         }

@@ -478,7 +478,7 @@ def refresh_album(item_id: str) -> dict[str, Any]:
     return item
 
 
-def refresh_library() -> dict[str, Any]:
+def refresh_library(progress_id: object = None) -> dict[str, Any]:
     targets = [
         target for target in storage.album_refresh_targets()
         if not target.get("artists") or not artwork.is_cached(target.get("cover_path"))
@@ -487,7 +487,15 @@ def refresh_library() -> dict[str, Any]:
     updated_ids: set[str] = set()
     errors: list[dict[str, str]] = []
     provider_warnings: list[dict[str, str]] = []
+    attempted_targets: list[dict[str, Any]] = []
+    recommendation_progress.start(
+        progress_id, len(targets), stage_id="library-refresh",
+        label="MusicBrainz / Cover Art Archive · карточки", unit="альбомов",
+    )
     for target in targets:
+        if recommendation_progress.is_cancelled(progress_id):
+            break
+        attempted_targets.append(target)
         try:
             details = resolve_album_input(target, fetch_popularity=False)
             storage.update_album_from_provider(str(target["id"]), details)
@@ -495,14 +503,25 @@ def refresh_library() -> dict[str, Any]:
             updated_ids.add(str(target["id"]))
         except Exception as error:
             errors.append({"title": str(target.get("title_original") or "Album"), "error": str(error)})
-    popularity_targets = [storage.get_item(str(target["id"])) for target in targets]
+        finally:
+            recommendation_progress.advance(progress_id, "library-refresh")
+    popularity_targets = [storage.get_item(str(target["id"])) for target in attempted_targets]
     popularity_mbids = [
         str(item.get("release_group_mbid") or "") for item in popularity_targets
         if item.get("release_group_mbid")
     ]
-    if popularity_mbids:
+    if popularity_mbids and not recommendation_progress.is_cancelled(progress_id):
+        batch_total = (len(popularity_mbids) + listenbrainz.BATCH_SIZE - 1) // listenbrainz.BATCH_SIZE
+        recommendation_progress.set_stage(
+            progress_id, "listenbrainz", "ListenBrainz · прослушивания",
+            batch_total, "пакетов",
+        )
         try:
-            counts = listenbrainz.release_group_popularity(popularity_mbids)
+            counts = listenbrainz.release_group_popularity(
+                popularity_mbids,
+                on_batch=lambda: recommendation_progress.advance(progress_id, "listenbrainz"),
+                should_cancel=lambda: recommendation_progress.is_cancelled(progress_id),
+            )
             storage.update_album_popularity(counts)
             updated_ids.update(
                 str(item["id"]) for item in popularity_targets
@@ -510,8 +529,10 @@ def refresh_library() -> dict[str, Any]:
             )
         except listenbrainz.ListenBrainzError as error:
             provider_warnings.append({"provider": "listenbrainz", "message": str(error)})
+    recommendation_progress.finish(progress_id)
     return {
         "total": len(targets), "updated": len(updated_ids), "failed": len(errors), "errors": errors,
+        "cancelled": recommendation_progress.is_cancelled(progress_id),
         "provider_warnings": provider_warnings + ([
             {"provider": "musicbrainz", "message": f"Не удалось обновить {len(errors)} альбомов из MusicBrainz."}
         ] if errors else []),
@@ -619,6 +640,8 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
     filtered_items: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for artist in artists:
+        if recommendation_progress.is_cancelled(progress_id):
+            break
         try:
             for item in browse_artist_albums(
                 str(artist["mbid"]), year_from, year_to, include_filtered=True,
@@ -672,6 +695,8 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
     )
     items: list[dict[str, Any]] = []
     for candidate in selected:
+        if recommendation_progress.is_cancelled(progress_id):
+            break
         try:
             items.append(album_details(
                 str(candidate["release_group_mbid"]), fetch_popularity=False,
@@ -704,6 +729,7 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
             continue_on_error=True,
             on_batch=lambda: recommendation_progress.advance(progress_id, "listenbrainz"),
             on_error=popularity_error,
+            should_cancel=lambda: recommendation_progress.is_cancelled(progress_id),
         )
         recommendation_progress.finish_stage(progress_id, "listenbrainz")
     else:
@@ -730,4 +756,5 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
     return {
         "items": items, "filtered_items": filtered_items,
         "errors": errors, "provider_warnings": combined_warnings,
+        "cancelled": recommendation_progress.is_cancelled(progress_id),
     }

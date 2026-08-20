@@ -150,6 +150,18 @@ class TmdbTests(unittest.TestCase):
         self.assertEqual(result["name_ru"],"Джек Николсон")
         self.assertEqual(result["details_json"]["birthday"],"1937-04-22")
 
+    def test_person_details_caches_small_tmdb_profile(self) -> None:
+        payload = {
+            "id":514, "name":"Jack Nicholson", "also_known_as":["Джек Николсон"],
+            "profile_path":"/jack.jpg", "known_for_department":"Acting",
+        }
+        with patch.object(tmdb,"_get",return_value=payload), \
+             patch.object(tmdb.artwork,"cache_person_profile",return_value="people/514.jpg") as cache:
+            result = tmdb.person_details(514,"key")
+        self.assertEqual(result["profile_url"],"https://image.tmdb.org/t/p/w185/jack.jpg")
+        self.assertEqual(result["profile_local_path"],"people/514.jpg")
+        cache.assert_called_once_with(514,"/jack.jpg","https://image.tmdb.org/t/p/w185/jack.jpg")
+
     def test_resolve_person_prefers_expected_department_and_popularity(self) -> None:
         payload = {"results":[
             {"id":1,"name":"Ari Aster","known_for_department":"Production","popularity":5},
@@ -204,6 +216,39 @@ class TmdbTests(unittest.TestCase):
         fetch.assert_called_once_with(targets[1], "key")
         save.assert_called_once_with("person-two", details)
         self.assertEqual(result["id"], "person-two")
+
+    def test_bulk_people_refresh_updates_people_without_tmdb_id_or_cached_profile(self) -> None:
+        targets = [
+            {"id":"known","name_original":"Known","name_ru":"Известный","role":"actor","tmdb_id":10,"external_id":10,"tmdb_updated_at":"2026-01-01","profile_path":"","profile_url":"","profile_local_path":""},
+            {"id":"missing","name_original":"Missing","name_ru":"Без ID","role":"director","tmdb_id":"","external_id":""},
+        ]
+        details = {"tmdb_id":20,"name_original":"Missing","name_ru":"Без ID","details_json":{}}
+        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb.storage,"list_interests",return_value=targets), \
+             patch.object(tmdb,"_fetch_person_target",return_value=("missing",details)) as fetch, \
+             patch.object(tmdb.storage,"update_interest_person") as save:
+            result = tmdb.refresh_people()
+        fetch.assert_called_once_with(targets[1], "key")
+        save.assert_called_once_with("missing", details)
+        self.assertEqual(result, {"total":1,"updated":1,"failed":0,"errors":[]})
+
+    def test_bulk_people_refresh_recaches_known_person_with_missing_profile_file(self) -> None:
+        target = {
+            "id":"known", "name_original":"Known", "name_ru":"Известный", "role":"actor",
+            "tmdb_id":10, "external_id":10, "tmdb_updated_at":"2026-01-01",
+            "profile_path":"/known.jpg", "profile_url":"https://image.tmdb.org/t/p/w185/known.jpg",
+            "profile_local_path":"people/10.jpg",
+        }
+        details = {"tmdb_id":10,"name_original":"Known","name_ru":"Известный","details_json":{}}
+        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb.storage,"list_interests",return_value=[target]), \
+             patch.object(tmdb.artwork,"is_cached",return_value=False), \
+             patch.object(tmdb,"_fetch_person_target",return_value=("known",details)) as fetch, \
+             patch.object(tmdb.storage,"update_interest_person") as save:
+            result = tmdb.refresh_people()
+        fetch.assert_called_once_with(target, "key")
+        save.assert_called_once_with("known", details)
+        self.assertEqual(result["updated"], 1)
 
     def test_refresh_movie_runs_full_tmdb_update_when_imdb_rating_is_missing(self) -> None:
         target = {
@@ -307,6 +352,39 @@ class TmdbTests(unittest.TestCase):
             {1, 2, 4},
         )
         enrich.assert_called_once_with(3, "key")
+
+    def test_api_recommendations_require_selected_person_before_provider_calls(self) -> None:
+        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb.storage,"list_interests",return_value=[]), \
+             patch.object(tmdb,"_get") as provider:
+            with self.assertRaisesRegex(tmdb.TmdbError, "выбрать хотя бы одного"):
+                tmdb.recommend_movies({"actor_ids":[], "director_ids":[]})
+        provider.assert_not_called()
+
+    def test_cancelled_api_recommendation_returns_completed_cards(self) -> None:
+        progress_id = "cancel-after-first-movie"
+        credits = {"cast":[
+            {"id":1,"title":"Первый","original_title":"First","release_date":"2024-01-01","genre_ids":[18],"vote_average":9,"vote_count":500},
+            {"id":2,"title":"Второй","original_title":"Second","release_date":"2024-02-01","genre_ids":[18],"vote_average":8,"vote_count":400},
+        ]}
+        interests = lambda _content, role: [{"id":"actor-one","external_id":10,"role":"actor"}] if role == "actor" else []
+
+        def details(movie_id: int, _api_key: str) -> dict[str, object]:
+            tmdb.recommendation_progress.cancel(progress_id)
+            return {
+                "tmdb_id":movie_id, "title_ru":"Первый", "title_original":"First",
+                "year":"2024", "duration_minutes":120, "imdb_rating":8, "genres":"драма",
+            }
+
+        with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb.storage,"list_interests",side_effect=interests), \
+             patch.object(tmdb.storage,"known_movie_keys",return_value=(set(),set())), \
+             patch.object(tmdb,"_get",return_value=credits), \
+             patch.object(tmdb,"movie_details",side_effect=details) as enrich:
+            result = tmdb.recommend_movies({"actor_ids":["actor-one"],"progress_id":progress_id})
+        self.assertTrue(result["cancelled"])
+        self.assertEqual([item["tmdb_id"] for item in result["items"]], [1])
+        enrich.assert_called_once_with(1, "key")
 
     def test_api_recommendations_filter_by_kinopoisk_rating(self) -> None:
         credits = {"cast":[{"id":3,"title":"Драма","original_title":"Drama","release_date":"2024-06-01","genre_ids":[18],"vote_average":8,"vote_count":500}]}
