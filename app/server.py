@@ -22,7 +22,8 @@ from app import artwork, fanart, listenbrainz, llm, musicbrainz, recommendation_
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PID_FILE = Path(__file__).resolve().parents[1] / ".runtime" / "server.pid"
-APP_VERSION = 47
+APPLICATION_ID = "whats-new-checker"
+APP_VERSION = 48
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -55,7 +56,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self._json({"ok": True, "version": APP_VERSION, "storage": "sqlite"})
+            self._json({
+                "ok": True, "application": APPLICATION_ID,
+                "version": APP_VERSION, "storage": "sqlite",
+            })
             return
         if parsed.path == "/api/library":
             query = parse_qs(parsed.query)
@@ -342,12 +346,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def _already_running(host: str, port: int) -> bool:
+def _health_payload(host: str, port: int) -> dict[str, object] | None:
     try:
         with urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=0.5) as response:
-            return response.status == 200
-    except Exception:
-        return False
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload if response.status == 200 and isinstance(payload, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _already_running(host: str, port: int) -> bool:
+    payload = _health_payload(host, port)
+    return bool(
+        payload
+        and payload.get("application") == APPLICATION_ID
+        and payload.get("version") == APP_VERSION
+    )
 
 
 def main() -> None:
@@ -362,7 +376,12 @@ def main() -> None:
             webbrowser.open(url)
         print(f"Already running at {url}")
         return
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as error:
+        raise SystemExit(
+            f"Cannot start {APPLICATION_ID}: {args.host}:{args.port} is occupied ({error})"
+        ) from error
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     if args.open_browser:

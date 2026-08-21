@@ -6,7 +6,7 @@ The active datastore is `data/library.sqlite3`. The application initializes miss
 
 - `content_types`: enabled `movie` and `music` content types.
 - `content_items`: bilingual titles, workflow status (`backlog`, `consumed`, `dismissed`), reaction (``, `like`, `dislike`), the backlog-only `planned_soon` marker, provenance, notes, original user input in `raw_json`, and timestamps.
-- `movies`: release date/year, runtime, separate IMDb, Kinopoisk, and TMDB ratings, vote counts, IMDb/Kinopoisk/TMDB IDs, overview, language, awards, tagline, certification, Metascore, box office, TMDB `poster_path`/`poster_url`, local `poster_local_path`, extended details JSON, and last TMDB refresh time.
+- `movies`: release date/year, runtime, separate IMDb, Kinopoisk, and TMDB ratings, vote counts, IMDb/Kinopoisk/TMDB IDs, overview, language, awards, tagline, certification, Metascore, box office, TMDB `poster_path`/`poster_url`, local `poster_local_path`, extended details JSON, and separate successful-check timestamps for TMDB, OMDb, and Kinopoisk.
 - `people`: canonical bilingual names, TMDB IDs, original user input in `raw_json`, extended TMDB details JSON, `profile_path`/`profile_url`/`profile_local_path`, and last refresh time.
 - `interest_roles`: active actors/directors used for recommendations.
 - `movie_people`: directors and matched interest people for each movie.
@@ -33,6 +33,8 @@ A future structured festival provider can add objects such as:
 TMDB does not expose structured awards. TMDB refresh therefore preserves existing awards unless an auxiliary provider returns new data.
 
 `kinopoisk_id` and `kinopoisk_rating` are filled by Kinopoisk API Unofficial during TMDB enrichment. The provider lookup uses the movie title and a ±1 year window because its IMDb mapping and canonical year may be absent or differ from TMDB; IMDb ID is used as an additional exact match when present in the response. A saved non-empty rating is treated as cached and is not requested again. The public Kinopoisk URL is derived as `https://www.kinopoisk.ru/film/{kinopoisk_id}/`.
+
+`omdb_updated_at` and `kinopoisk_updated_at` are written only after a successful provider response, including a successful response with no matching rating. This distinguishes a confirmed absence from a transient request failure. Missing artwork and ListenBrainz/fanart.tv data follow the same rule through their existing provider timestamps; bulk refresh retries missing local files but does not repeatedly query a confirmed absent remote asset.
 
 `movies.details_json` stores optional provider fields that should not expand the main table: cast, writers, countries, production companies, spoken languages, keywords, budget, revenue, homepage, and provider status. Poster metadata is stored in dedicated columns. The HTTP API flattens optional fields for the movie detail card.
 

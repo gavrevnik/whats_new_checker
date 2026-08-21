@@ -139,7 +139,10 @@ def _get_omdb(imdb_id: str) -> dict[str, Any]:
         payload = _request_json(f"{OMDB_URL}?{query}")
     except TmdbError:
         return {}
-    if payload.get("Response") == "False":
+    response_status = payload.get("Response")
+    if response_status == "False":
+        return {"omdb_checked": True}
+    if response_status != "True":
         return {}
     def clean(key: str) -> str:
         value = str(payload.get(key) or "").strip()
@@ -148,8 +151,13 @@ def _get_omdb(imdb_id: str) -> dict[str, Any]:
     rating_raw = clean("imdbRating")
     metascore_raw = clean("Metascore")
     awards = str(payload.get("Awards") or "").strip()
+    try:
+        numeric_rating = float(rating_raw) if rating_raw else None
+    except ValueError:
+        numeric_rating = None
     return {
-        "imdb_rating": float(rating_raw) if rating_raw else None,
+        "omdb_checked": True,
+        "imdb_rating": numeric_rating,
         "imdb_votes": clean("imdbVotes"),
         "metascore": int(metascore_raw) if metascore_raw.isdigit() else None,
         "content_rating": clean("Rated"),
@@ -170,8 +178,10 @@ def _get_kinopoisk(imdb_id: str, title_original: str, title_ru: str, year: Any) 
         return {}
     target_year = int(year) if str(year).isdigit() else None
     request_errors: list[TmdbError] = []
+    request_succeeded = False
 
     def fetch(params: dict[str, Any]) -> list[dict[str, Any]]:
+        nonlocal request_succeeded
         try:
             payload = _request_json(
                 f"{KINOPOISK_URL}?{urllib.parse.urlencode(params)}",
@@ -181,7 +191,10 @@ def _get_kinopoisk(imdb_id: str, title_original: str, title_ru: str, year: Any) 
             request_errors.append(error)
             return []
         items = payload.get("items", [])
-        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        if not isinstance(items, list):
+            return []
+        request_succeeded = True
+        return [item for item in items if isinstance(item, dict)]
 
     candidates: list[dict[str, Any]] = []
     if imdb_id:
@@ -227,17 +240,18 @@ def _get_kinopoisk(imdb_id: str, title_original: str, title_ru: str, year: Any) 
             }],
         }
     if not candidates:
-        return {}
+        return {"kinopoisk_checked": True} if request_succeeded else {}
     candidate = max(candidates, key=lambda item: float(item.get("ratingKinopoisk") or 0))
     kinopoisk_id = candidate.get("kinopoiskId")
     rating = candidate.get("ratingKinopoisk")
     if not str(kinopoisk_id).isdigit():
-        return {}
+        return {"kinopoisk_checked": True}
     try:
         numeric_rating = float(rating) if rating not in (None, "") else None
     except (TypeError, ValueError):
         numeric_rating = None
     return {
+        "kinopoisk_checked": True,
         "kinopoisk_id": int(kinopoisk_id),
         "kinopoisk_rating": numeric_rating,
         "kinopoisk_link": f"https://www.kinopoisk.ru/film/{int(kinopoisk_id)}/",
@@ -268,6 +282,7 @@ def movie_details(
     tmdb_id: int,
     api_key: str | None = None,
     fetch_kinopoisk: bool = True,
+    fetch_omdb: bool = True,
 ) -> dict[str, Any]:
     api_key = api_key or get_api_key()[0]
     if not api_key:
@@ -321,7 +336,11 @@ def movie_details(
             })
             seen.add(marker)
     imdb_id = str(details.get("imdb_id") or "")
-    companion = _get_omdb(imdb_id)
+    companion = (
+        _get_omdb(imdb_id)
+        if fetch_omdb and imdb_id
+        else ({"omdb_checked": True} if fetch_omdb else {})
+    )
     release_date = str(details.get("release_date") or "")
     kinopoisk = _get_kinopoisk(
         imdb_id,
@@ -368,6 +387,7 @@ def movie_details(
         key_parts.append(f"Режиссёры: {key_directors}")
     payload = {
         "content_type": "movie",
+        "tmdb_checked": True,
         "title_ru": str(details.get("title") or ""),
         "title_original": str(details.get("original_title") or ""),
         "release_date": release_date,
@@ -382,11 +402,13 @@ def movie_details(
         "genres_data": details.get("genres", []),
         "duration_minutes": details.get("runtime"),
         "imdb_rating": companion.get("imdb_rating"),
+        "omdb_checked": bool(companion.get("omdb_checked")),
         "tmdb_rating": round(float(details.get("vote_average") or 0), 1),
         "tmdb_vote_count": int(details.get("vote_count") or 0),
         "imdb_id": imdb_id,
         "tmdb_id": int(details["id"]),
         **kinopoisk,
+        "kinopoisk_checked": bool(kinopoisk.get("kinopoisk_checked")),
         "overview": str(details.get("overview") or companion.get("omdb_plot") or ""),
         "original_language": str(details.get("original_language") or ""),
         "awards_json": companion.get("awards_json", []),
@@ -671,9 +693,11 @@ def _movie_rating_details(target: dict[str, Any]) -> dict[str, Any]:
         imdb_id = str(basic.get("imdb_id") or "")
         details.update({"tmdb_id": int(tmdb_id), "imdb_id": imdb_id})
     if needs_imdb:
-        companion = _get_omdb(imdb_id)
+        companion = _get_omdb(imdb_id) if imdb_id else {"omdb_checked": True}
         if companion.get("imdb_rating") is not None:
             details["imdb_rating"] = companion["imdb_rating"]
+        if companion.get("omdb_checked"):
+            details["omdb_checked"] = True
     if needs_kinopoisk:
         kinopoisk = _get_kinopoisk(
             imdb_id,
@@ -685,20 +709,31 @@ def _movie_rating_details(target: dict[str, Any]) -> dict[str, Any]:
     return details
 
 
+def _movie_refresh_requirements(target: dict[str, Any]) -> tuple[bool, bool, bool, bool]:
+    tmdb_updated = bool(str(target.get("tmdb_updated_at") or "").strip())
+    needs_tmdb = not str(target.get("tmdb_id") or "").isdigit() or not tmdb_updated
+    needs_imdb = (
+        target.get("imdb_rating") in (None, "")
+        and bool(get_omdb_key()[0])
+        and not str(target.get("omdb_updated_at") or "").strip()
+    )
+    needs_kinopoisk = (
+        target.get("kinopoisk_rating") in (None, "")
+        and bool(get_kinopoisk_key()[0])
+        and not str(target.get("kinopoisk_updated_at") or "").strip()
+    )
+    has_poster_source = bool(
+        str(target.get("poster_path") or "").strip()
+        or str(target.get("poster_url") or "").strip()
+    )
+    needs_poster = (
+        has_poster_source and not artwork.is_cached(target.get("poster_local_path"))
+    ) or (not has_poster_source and not tmdb_updated)
+    return needs_tmdb, needs_imdb, needs_kinopoisk, needs_poster
+
+
 def _needs_movie_refresh(target: dict[str, Any]) -> bool:
-    needs_tmdb = any(
-        field in target and target.get(field) in (None, "")
-        for field in (
-            "tmdb_updated_at", "tmdb_id", "release_date", "duration_minutes",
-            "directors", "genres", "overview", "cast",
-        )
-    )
-    return (
-        needs_tmdb
-        or target.get("imdb_rating") in (None, "")
-        or target.get("kinopoisk_rating") in (None, "")
-        or not artwork.is_cached(target.get("poster_local_path"))
-    )
+    return any(_movie_refresh_requirements(target))
 
 
 def _poster_details(target: dict[str, Any]) -> dict[str, Any]:
@@ -730,19 +765,10 @@ def _poster_details(target: dict[str, Any]) -> dict[str, Any]:
 
 def _refresh_movie_target(target: dict[str, Any]) -> dict[str, Any]:
     item_id = str(target["id"])
-    needs_imdb = target.get("imdb_rating") in (None, "")
-    needs_tmdb = any(
-        field in target and target.get(field) in (None, "")
-        for field in (
-            "tmdb_updated_at", "tmdb_id", "release_date", "duration_minutes",
-            "directors", "genres", "overview", "cast",
-        )
-    )
-    needs_kinopoisk = target.get("kinopoisk_rating") in (None, "")
-    needs_poster = not artwork.is_cached(target.get("poster_local_path"))
+    needs_tmdb, needs_imdb, needs_kinopoisk, needs_poster = _movie_refresh_requirements(target)
     warnings: list[dict[str, str]] = []
 
-    if needs_imdb or needs_tmdb:
+    if needs_tmdb:
         api_key, _ = get_api_key()
         if not api_key:
             raise TmdbError("TMDB_API_KEY is not configured")
@@ -752,17 +778,20 @@ def _refresh_movie_target(target: dict[str, Any]) -> dict[str, Any]:
                 str(target.get("title_original") or ""),
                 str(target.get("title_ru") or ""), target.get("year"), api_key,
             )
-        details = movie_details(int(tmdb_id), api_key, fetch_kinopoisk=needs_kinopoisk)
+        details = movie_details(
+            int(tmdb_id), api_key,
+            fetch_kinopoisk=needs_kinopoisk, fetch_omdb=needs_imdb,
+        )
         item = storage.update_movie_from_provider(item_id, details)
         warnings.extend(details.get("provider_warnings", []))
     else:
         item = target
-        if needs_kinopoisk:
-            details = _get_kinopoisk(
-                str(target.get("imdb_id") or ""),
-                str(target.get("title_original") or ""),
-                str(target.get("title_ru") or ""), target.get("year"),
-            )
+        if needs_imdb or needs_kinopoisk:
+            details = _movie_rating_details({
+                **target,
+                "imdb_rating": target.get("imdb_rating") if needs_imdb else 0,
+                "kinopoisk_rating": target.get("kinopoisk_rating") if needs_kinopoisk else 0,
+            })
             item = storage.update_movie_ratings(item_id, details)
             warnings.extend(details.get("provider_warnings", []))
         if needs_poster:

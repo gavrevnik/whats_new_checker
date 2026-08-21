@@ -76,7 +76,9 @@ CREATE TABLE IF NOT EXISTS movies (
     poster_url TEXT NOT NULL DEFAULT '',
     poster_local_path TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
-    tmdb_updated_at TEXT
+    tmdb_updated_at TEXT,
+    omdb_updated_at TEXT,
+    kinopoisk_updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS albums (
@@ -305,6 +307,8 @@ def initialize_database(path: Path | None = None) -> None:
                 "poster_url": "TEXT NOT NULL DEFAULT ''",
                 "poster_local_path": "TEXT NOT NULL DEFAULT ''",
                 "details_json": "TEXT NOT NULL DEFAULT '{}'",
+                "omdb_updated_at": "TEXT",
+                "kinopoisk_updated_at": "TEXT",
             },
             "people": {
                 "raw_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -411,6 +415,9 @@ def initialize_database(path: Path | None = None) -> None:
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (11, ?)", (_now(),)
         )
         connection.execute(
+            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (12, ?)", (_now(),)
+        )
+        connection.execute(
             "INSERT OR IGNORE INTO content_types(code, name_ru, enabled) VALUES ('movie', 'Фильмы', 1)"
         )
         connection.execute(
@@ -451,6 +458,8 @@ def _movie_select(where: str = "", params: tuple[Any, ...] = ()) -> list[dict[st
             COALESCE(m.poster_local_path, '') AS stored_poster_local_path,
             COALESCE(m.details_json, '{{}}') AS details_json,
             COALESCE(m.tmdb_updated_at, '') AS tmdb_updated_at,
+            COALESCE(m.omdb_updated_at, '') AS omdb_updated_at,
+            COALESCE(m.kinopoisk_updated_at, '') AS kinopoisk_updated_at,
             EXISTS(SELECT 1 FROM favorite_movies f WHERE f.content_id = i.id) AS favorite,
             COALESCE((
                 SELECT group_concat(display_name, '; ')
@@ -1062,13 +1071,15 @@ def add_music_artist(artist: dict[str, Any]) -> dict[str, Any]:
                 "disambiguation = COALESCE(NULLIF(?, ''), disambiguation), raw_json = ?, "
                 "profile_url = COALESCE(NULLIF(?, ''), profile_url), "
                 "profile_local_path = COALESCE(NULLIF(?, ''), profile_local_path), "
+                "musicbrainz_updated_at = CASE WHEN ? THEN ? ELSE musicbrainz_updated_at END, "
                 "fanart_updated_at = CASE WHEN ? THEN ? ELSE fanart_updated_at END WHERE id = ?",
                 (
                     name, str(artist.get("sort_name") or ""), mbid,
                     str(artist.get("artist_type") or artist.get("type") or ""),
                     str(artist.get("country") or ""), str(artist.get("area") or ""),
                     str(artist.get("disambiguation") or ""), raw_json, profile_url,
-                    profile_local_path, int(fanart_checked), _now(), artist_id,
+                    profile_local_path, int(bool(artist.get("musicbrainz_checked"))), _now(),
+                    int(fanart_checked), _now(), artist_id,
                 ),
             )
         else:
@@ -1084,7 +1095,9 @@ def add_music_artist(artist: dict[str, Any]) -> dict[str, Any]:
                     str(artist.get("disambiguation") or ""), str(artist.get("life_span_begin") or ""),
                     str(artist.get("life_span_end") or ""), raw_json,
                     _json(artist.get("details_json") or {}, "{}"),
-                    artist.get("musicbrainz_updated_at") or None,
+                    artist.get("musicbrainz_updated_at") or (
+                        _now() if artist.get("musicbrainz_checked") else None
+                    ),
                     profile_url, profile_local_path, _now() if fanart_checked else None,
                 ),
             )
@@ -1157,8 +1170,16 @@ def update_interest_person(person_id: str, details: dict[str, Any]) -> dict[str,
             for credit in credits:
                 connection.execute(
                     "INSERT OR REPLACE INTO movie_people(movie_id, person_id, credit_role, character_name, job, is_interest) "
-                    "VALUES (?, ?, ?, ?, ?, 1)",
-                    (credit["movie_id"], person_id, credit["credit_role"], credit["character_name"], credit["job"]),
+                    "VALUES (?, ?, ?, ?, ?, CASE WHEN EXISTS ("
+                    "SELECT 1 FROM interest_roles ir WHERE ir.person_id = ? "
+                    "AND ir.content_type = 'movie' AND ir.role = ? AND NOT EXISTS ("
+                    "SELECT 1 FROM trash_entries t WHERE t.entity_type = 'person' "
+                    "AND t.entity_id = ir.person_id AND t.role = ir.role)) THEN 1 ELSE 0 END)",
+                    (
+                        credit["movie_id"], person_id, credit["credit_role"],
+                        credit["character_name"], credit["job"], person_id,
+                        credit["credit_role"],
+                    ),
                 )
             connection.execute("DELETE FROM people WHERE id = ?", (duplicate_id,))
         connection.execute(
@@ -1455,7 +1476,10 @@ def _add_album(item: dict[str, Any]) -> dict[str, Any]:
                 str(item.get("catalog_number") or ""), str(item.get("barcode") or ""),
                 str(item.get("media_formats") or ""), str(item.get("cover_url") or ""),
                 str(item.get("cover_path") or ""),
-                _json(item.get("details_json") or {}, "{}"), item.get("musicbrainz_updated_at") or None,
+                _json(item.get("details_json") or {}, "{}"),
+                item.get("musicbrainz_updated_at") or (
+                    now if item.get("musicbrainz_checked") else None
+                ),
                 item.get("cover_art_updated_at") or (
                     now if mbid and item.get("cover_art_checked") is not False else None
                 ),
@@ -1513,8 +1537,8 @@ def add_item(item: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         connection.execute(
-            "INSERT INTO movies(content_id, release_date, release_year, runtime_minutes, imdb_rating, kinopoisk_rating, tmdb_rating, tmdb_vote_count, imdb_id, kinopoisk_id, tmdb_id, overview, original_language, awards_json, tagline, content_rating, imdb_votes, metascore, box_office, poster_path, poster_url, poster_local_path, details_json, tmdb_updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO movies(content_id, release_date, release_year, runtime_minutes, imdb_rating, kinopoisk_rating, tmdb_rating, tmdb_vote_count, imdb_id, kinopoisk_id, tmdb_id, overview, original_language, awards_json, tagline, content_rating, imdb_votes, metascore, box_office, poster_path, poster_url, poster_local_path, details_json, tmdb_updated_at, omdb_updated_at, kinopoisk_updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 item_id, item.get("release_date") or None, _year(item), item.get("duration_minutes") or item.get("runtime_minutes") or None,
                 imdb_rating or None, item.get("kinopoisk_rating") or None, tmdb_rating or None,
@@ -1527,7 +1551,10 @@ def add_item(item: dict[str, Any]) -> dict[str, Any]:
                 item.get("metascore") or None, str(item.get("box_office") or ""),
                 str(item.get("poster_path") or ""), str(item.get("poster_url") or ""),
                 str(item.get("poster_local_path") or ""),
-                _json(item.get("details_json") or _detail_payload(item), "{}"), item.get("tmdb_updated_at") or None,
+                _json(item.get("details_json") or _detail_payload(item), "{}"),
+                item.get("tmdb_updated_at") or (now if item.get("tmdb_checked") else None),
+                item.get("omdb_updated_at") or (now if item.get("omdb_checked") else None),
+                item.get("kinopoisk_updated_at") or (now if item.get("kinopoisk_checked") else None),
             ),
         )
         _replace_movie_relations(connection, item_id, item)
@@ -1579,6 +1606,7 @@ def update_item(item_id: str, changes: dict[str, Any]) -> dict[str, Any]:
 
 def update_movie_from_provider(item_id: str, details: dict[str, Any]) -> dict[str, Any]:
     initialize_database()
+    refreshed_at = _now()
     with _lock, connect() as connection:
         if not connection.execute("SELECT 1 FROM movies WHERE content_id = ?", (item_id,)).fetchone():
             raise StorageError("Movie not found")
@@ -1596,7 +1624,10 @@ def update_movie_from_provider(item_id: str, details: dict[str, Any]) -> dict[st
             "content_rating = COALESCE(NULLIF(?, ''), content_rating), imdb_votes = COALESCE(NULLIF(?, ''), imdb_votes), "
             "metascore = COALESCE(?, metascore), box_office = COALESCE(NULLIF(?, ''), box_office), "
             "poster_path = ?, poster_url = ?, poster_local_path = ?, "
-            "details_json = ?, tmdb_updated_at = ? WHERE content_id = ?",
+            "details_json = ?, tmdb_updated_at = ?, "
+            "omdb_updated_at = CASE WHEN ? THEN ? ELSE omdb_updated_at END, "
+            "kinopoisk_updated_at = CASE WHEN ? THEN ? ELSE kinopoisk_updated_at END "
+            "WHERE content_id = ?",
             (
                 details.get("release_date") or None, _year(details), details.get("duration_minutes") or None,
                 details.get("imdb_rating") or None, details.get("kinopoisk_rating") or None,
@@ -1609,7 +1640,8 @@ def update_movie_from_provider(item_id: str, details: dict[str, Any]) -> dict[st
                 str(details.get("box_office") or ""), str(details.get("poster_path") or ""),
                 str(details.get("poster_url") or ""), str(details.get("poster_local_path") or ""),
                 _json(details.get("details_json") or _detail_payload(details), "{}"),
-                _now(), item_id,
+                refreshed_at, int(bool(details.get("omdb_checked"))), refreshed_at,
+                int(bool(details.get("kinopoisk_checked"))), refreshed_at, item_id,
             ),
         )
         _replace_movie_relations(connection, item_id, details)
@@ -1639,7 +1671,10 @@ def update_movie_ratings(item_id: str, details: dict[str, Any]) -> dict[str, Any
             "kinopoisk_rating = CASE WHEN ? THEN ? ELSE kinopoisk_rating END, "
             "imdb_id = COALESCE(NULLIF(?, ''), imdb_id), "
             "kinopoisk_id = COALESCE(?, kinopoisk_id), "
-            "tmdb_id = COALESCE(?, tmdb_id), tmdb_updated_at = ? WHERE content_id = ?",
+            "tmdb_id = COALESCE(?, tmdb_id), "
+            "omdb_updated_at = CASE WHEN ? THEN ? ELSE omdb_updated_at END, "
+            "kinopoisk_updated_at = CASE WHEN ? THEN ? ELSE kinopoisk_updated_at END "
+            "WHERE content_id = ?",
             (
                 int(has_imdb_rating), details.get("imdb_rating"),
                 int(has_kinopoisk_rating), details.get("kinopoisk_rating"),
@@ -1648,7 +1683,8 @@ def update_movie_ratings(item_id: str, details: dict[str, Any]) -> dict[str, Any
                 if str(details.get("kinopoisk_id") or "").isdigit() else None,
                 int(details["tmdb_id"])
                 if str(details.get("tmdb_id") or "").isdigit() else None,
-                refreshed_at, item_id,
+                int(bool(details.get("omdb_checked"))), refreshed_at,
+                int(bool(details.get("kinopoisk_checked"))), refreshed_at, item_id,
             ),
         )
         connection.execute(
@@ -1761,7 +1797,7 @@ def movie_refresh_targets() -> list[dict[str, Any]]:
             "id", "title_original", "title_ru", "year", "tmdb_id", "imdb_id",
             "imdb_rating", "kinopoisk_rating", "directors", "poster_path", "poster_url",
             "poster_local_path", "release_date", "duration_minutes", "genres", "overview",
-            "cast", "tmdb_updated_at",
+            "cast", "tmdb_updated_at", "omdb_updated_at", "kinopoisk_updated_at",
         )}
         for row in list_library(content_type="movie")
     ]
@@ -1864,11 +1900,18 @@ def artist_refresh_targets() -> list[dict[str, Any]]:
     return [
         {key: row.get(key) for key in (
             "id", "name_original", "name_ru", "mbid", "profile_url", "profile_local_path",
+            "musicbrainz_updated_at", "fanart_updated_at",
         )}
         for row in list_music_artists()
         if not str(row.get("mbid") or row.get("external_id") or "").strip()
         or not str(row.get("musicbrainz_updated_at") or "").strip()
-        or not artwork.is_cached(row.get("profile_local_path"))
+        or (
+            not artwork.is_cached(row.get("profile_local_path"))
+            and (
+                bool(str(row.get("profile_url") or "").strip())
+                or not str(row.get("fanart_updated_at") or "").strip()
+            )
+        )
     ]
 
 

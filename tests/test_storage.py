@@ -79,6 +79,7 @@ class StorageTests(unittest.TestCase):
             self.assertIn("poster_path", movie_columns)
             self.assertIn("poster_url", movie_columns)
             self.assertIn("poster_local_path", movie_columns)
+            self.assertTrue({"tmdb_updated_at", "omdb_updated_at", "kinopoisk_updated_at"} <= movie_columns)
             album_columns = {row[1] for row in connection.execute("PRAGMA table_info(albums)")}
             self.assertIn("cover_url", album_columns)
             self.assertIn("cover_path", album_columns)
@@ -196,6 +197,20 @@ class StorageTests(unittest.TestCase):
         targets = storage.artist_refresh_targets()
         self.assertEqual([target["id"] for target in targets], [artist["id"]])
 
+    def test_artist_refresh_targets_cache_negative_fanart_result_but_repair_known_image(self) -> None:
+        absent = storage.add_music_artist({
+            "name":"No Image", "mbid":"no-image", "musicbrainz_checked":True,
+            "fanart_checked":True,
+        })
+        repair = storage.add_music_artist({
+            "name":"Lost Image", "mbid":"lost-image", "musicbrainz_checked":True,
+            "fanart_checked":True, "profile_url":"https://fanart.test/lost.jpg",
+        })
+        with patch.object(artwork, "is_cached", return_value=False):
+            targets = storage.artist_refresh_targets()
+        self.assertNotIn(absent["id"], [target["id"] for target in targets])
+        self.assertIn(repair["id"], [target["id"] for target in targets])
+
     def test_people_can_be_added_and_refreshed(self) -> None:
         created = storage.add_interest_person({
             "role":"actor", "name_original":"Jack Nicholson", "name_ru":"Джек Николсон", "tmdb_id":514,
@@ -215,9 +230,20 @@ class StorageTests(unittest.TestCase):
         created = storage.add_interest_person({
             "role":"director", "name_original":"Bennett Miller", "name_ru":"Беннетт Миллер", "tmdb_id":999999,
         })
+        movie = storage.add_item({
+            "content_type":"movie", "title_original":"Foxcatcher", "title_ru":"Охотник на лис",
+        })
         with storage.connect() as connection:
             connection.execute(
                 "INSERT INTO people(id,name_original,name_ru,tmdb_id,active) VALUES ('provider-copy','Bennett Miller','Беннетт Миллер',5345,0)"
+            )
+            connection.execute(
+                "INSERT INTO movie_people(movie_id,person_id,credit_role,is_interest) VALUES (?,'provider-copy','director',0)",
+                (movie["id"],),
+            )
+            connection.execute(
+                "INSERT INTO movie_people(movie_id,person_id,credit_role,is_interest) VALUES (?,'provider-copy','actor',0)",
+                (movie["id"],),
             )
         updated = storage.update_interest_person(created["id"], {
             "tmdb_id":5345, "name_original":"Bennett Miller", "name_ru":"Беннетт Миллер",
@@ -225,6 +251,43 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(updated["tmdb_id"], 5345)
         with storage.connect() as connection:
             self.assertIsNone(connection.execute("SELECT 1 FROM people WHERE id='provider-copy'").fetchone())
+            flags = {
+                row["credit_role"]: row["is_interest"]
+                for row in connection.execute(
+                    "SELECT credit_role,is_interest FROM movie_people WHERE movie_id=? AND person_id=?",
+                    (movie["id"], created["id"]),
+                )
+            }
+        self.assertEqual(flags, {"actor":0, "director":1})
+
+    def test_successful_provider_checks_are_timestamped_on_insert(self) -> None:
+        movie = storage.add_item({
+            "content_type":"movie", "title_original":"Checked", "title_ru":"Проверен",
+            "tmdb_id":123, "tmdb_checked":True, "omdb_checked":True,
+            "kinopoisk_checked":True,
+        })
+        album = storage.add_item({
+            "content_type":"music", "title_original":"Checked Album", "title_ru":"Checked Album",
+            "release_group_mbid":"rg-checked", "musicbrainz_checked":True,
+            "cover_art_checked":True, "total_listen_count":None,
+        })
+        artist = storage.add_music_artist({
+            "name":"Checked Artist", "mbid":"artist-checked", "musicbrainz_checked":True,
+            "fanart_checked":True,
+        })
+        storage.add_music_artist({"name":"Resolved Existing"})
+        resolved_existing = storage.add_music_artist({
+            "name":"Resolved Existing", "mbid":"resolved-existing", "musicbrainz_checked":True,
+        })
+        self.assertTrue(movie["tmdb_updated_at"])
+        self.assertTrue(movie["omdb_updated_at"])
+        self.assertTrue(movie["kinopoisk_updated_at"])
+        self.assertTrue(album["musicbrainz_updated_at"])
+        self.assertTrue(album["cover_art_updated_at"])
+        self.assertTrue(album["listenbrainz_updated_at"])
+        self.assertTrue(artist["musicbrainz_updated_at"])
+        self.assertTrue(artist["fanart_updated_at"])
+        self.assertTrue(resolved_existing["musicbrainz_updated_at"])
 
     def test_provider_details_and_external_links_are_persisted(self) -> None:
         created = storage.add_item({"content_type":"movie","title_original":"Test","title_ru":"Тест","tmdb_id":123})

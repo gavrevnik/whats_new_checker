@@ -15,9 +15,52 @@ RUNTIME_DIR="${REPO_DIR}/.runtime"
 PID_FILE="${RUNTIME_DIR}/server.pid"
 LOG_FILE="${RUNTIME_DIR}/server.log"
 EXPECTED_VERSION=$(cd "${REPO_DIR}" && "${PYTHON_BIN}" -c 'from app.server import APP_VERSION; print(APP_VERSION)')
+EXPECTED_APPLICATION="whats-new-checker"
 
 health_payload=$(/usr/bin/curl -fsS --max-time 1 "${HEALTH_URL}" 2>/dev/null || true)
+running_application=$(print -r -- "${health_payload}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin).get("application", ""))' 2>/dev/null || true)
 running_version=$(print -r -- "${health_payload}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin).get("version", ""))' 2>/dev/null || true)
+
+if [[ -z "${health_payload}" ]]; then
+  listener_pid=$(/usr/sbin/lsof -tiTCP:8765 -sTCP:LISTEN 2>/dev/null | /usr/bin/head -n 1 || true)
+  if [[ "${listener_pid}" == <-> ]]; then
+    listener_command=$(/bin/ps -p "${listener_pid}" -o command= 2>/dev/null || true)
+    if [[ "${listener_command}" == *"${REPO_DIR}/app/server.py"* ]]; then
+      /bin/kill "${listener_pid}" 2>/dev/null || true
+      for _ in {1..30}; do
+        /bin/kill -0 "${listener_pid}" 2>/dev/null || break
+        /bin/sleep 0.1
+      done
+      if /bin/kill -0 "${listener_pid}" 2>/dev/null; then
+        /usr/bin/osascript -e 'display alert "whatsNew" message "Локальный сервер whatsNew не отвечает и его не удалось остановить. Завершите процесс и повторите запуск." as critical'
+        exit 1
+      fi
+    else
+      /usr/bin/osascript -e 'display alert "whatsNew" message "Порт 8765 занят другим приложением. Остановите его или освободите порт перед запуском whatsNew." as critical'
+      exit 1
+    fi
+  fi
+fi
+
+if [[ -n "${health_payload}" && "${running_application}" != "${EXPECTED_APPLICATION}" ]]; then
+  legacy_pid=""
+  if [[ -f "${PID_FILE}" ]]; then
+    legacy_pid=$(<"${PID_FILE}")
+  else
+    legacy_pid=$(/usr/sbin/lsof -tiTCP:8765 -sTCP:LISTEN 2>/dev/null | /usr/bin/head -n 1 || true)
+  fi
+  legacy_command=""
+  if [[ "${legacy_pid}" == <-> ]]; then
+    legacy_command=$(/bin/ps -p "${legacy_pid}" -o command= 2>/dev/null || true)
+  fi
+  if [[ "${legacy_command}" == *"${REPO_DIR}/app/server.py"* ]]; then
+    running_application="${EXPECTED_APPLICATION}"
+    running_version=""
+  else
+    /usr/bin/osascript -e 'display alert "whatsNew" message "Порт 8765 занят другим приложением. Остановите его или освободите порт перед запуском whatsNew." as critical'
+    exit 1
+  fi
+fi
 
 if [[ -n "${health_payload}" && "${running_version}" != "${EXPECTED_VERSION}" ]]; then
   server_pid=""
@@ -36,7 +79,11 @@ if [[ -n "${health_payload}" && "${running_version}" != "${EXPECTED_VERSION}" ]]
       done
     fi
   fi
-  health_payload=""
+  health_payload=$(/usr/bin/curl -fsS --max-time 1 "${HEALTH_URL}" 2>/dev/null || true)
+  if [[ -n "${health_payload}" ]]; then
+    /usr/bin/osascript -e 'display alert "whatsNew" message "Обнаружен устаревший сервер whatsNew, но его не удалось остановить. Завершите процесс и повторите запуск." as critical'
+    exit 1
+  fi
 fi
 
 if [[ -z "${health_payload}" ]]; then
@@ -50,7 +97,10 @@ if [[ -z "${health_payload}" ]]; then
   done
 fi
 
-if /usr/bin/curl -fsS --max-time 1 "${HEALTH_URL}" >/dev/null 2>&1; then
+health_payload=$(/usr/bin/curl -fsS --max-time 1 "${HEALTH_URL}" 2>/dev/null || true)
+running_application=$(print -r -- "${health_payload}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin).get("application", ""))' 2>/dev/null || true)
+running_version=$(print -r -- "${health_payload}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin).get("version", ""))' 2>/dev/null || true)
+if [[ "${running_application}" == "${EXPECTED_APPLICATION}" && "${running_version}" == "${EXPECTED_VERSION}" ]]; then
   /usr/bin/open "${URL}"
 else
   /usr/bin/osascript -e 'display alert "whatsNew" message "Не удалось запустить локальный сервер. Подробности: .runtime/server.log" as critical'

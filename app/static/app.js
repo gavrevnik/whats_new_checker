@@ -1,6 +1,7 @@
 const state = { items: [], interests: [], trash: [], view: "backlog", contentType: "movie", backlogRecommendMode: "llm", query: "", apiItems: [], apiFilteredItems: [], apiPeriod: "", llmItems: [], llmFilteredItems: [], llmErrors: [], llmRawResponse: "", recommendationCancelled: false, peopleRecommendationItems: [], peopleRecommendationErrors: [], peopleRecommendationCancelled: false, apiProgressWarnings: [], recommendationSort: {key:"year",direction:"desc"}, tmdb: {}, musicbrainz: {}, llm: {}, llmContextSeed: "", sortKey: "release_date", sortDirection: "desc", peopleSort: {director:{key:"name_ru",direction:"asc"},actor:{key:"name_ru",direction:"asc"},artist:{key:"name_original",direction:"asc"}}, currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingAlbumDetails: null, pendingPersonDetails: null, pendingArtistDetails: null, pendingMovieRaw: null, pendingAlbumRaw: null, pendingPersonRaw: null, pendingArtistRaw: null, pendingMovieSearchField: "", pendingAlbumSearchField: "" };
 const activeOperations = {recommendation:"",people:"",refresh:""};
 const operationRunning = () => Object.values(activeOperations).some(Boolean);
+let contentTypeSwitching = false;
 const $ = selector => document.querySelector(selector);
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
 
@@ -541,6 +542,21 @@ function clearActionFeedback(button, container) {
   container?.classList.remove("action-pending", "action-exiting");
 }
 
+function lockActionTable(button) {
+  const table = button.closest(".table-wrap");
+  if (!table || table.dataset.actionBusy) return null;
+  table.dataset.actionBusy = "true";
+  table.setAttribute("aria-busy", "true");
+  table.inert = true;
+  table.classList.add("table-action-busy");
+  return () => {
+    delete table.dataset.actionBusy;
+    table.removeAttribute("aria-busy");
+    table.inert = false;
+    table.classList.remove("table-action-busy");
+  };
+}
+
 async function cardActionWithFeedback(button, task, {exit = false} = {}) {
   if (button.dataset.actionBusy) return null;
   const container = actionFeedbackContainer(button);
@@ -749,10 +765,28 @@ function applyContentLabels() {
 }
 
 async function changeContentType(contentType) {
-  state.contentType = contentType; state.query = ""; syncSearchControls();
-  state.sortKey = "release_date"; state.sortDirection = "desc";
-  const [library, people] = await Promise.all([request(`/api/library?content_type=${encodeURIComponent(contentType)}`), request(`/api/people?content_type=${encodeURIComponent(contentType)}`)]);
-  state.items = library.items; state.interests = people.items; applyContentLabels(); renderLibrary(); renderPeople(); renderInterestOptions(); renderTrash();
+  if (contentTypeSwitching) return;
+  contentTypeSwitching = true;
+  const buttons = [...document.querySelectorAll("[data-content-type]")];
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    const [library, people] = await Promise.all([
+      request(`/api/library?content_type=${encodeURIComponent(contentType)}`),
+      request(`/api/people?content_type=${encodeURIComponent(contentType)}`),
+    ]);
+    state.contentType = contentType;
+    state.query = "";
+    state.sortKey = "release_date";
+    state.sortDirection = "desc";
+    state.items = library.items;
+    state.interests = people.items;
+    applyContentLabels(); renderLibrary(); renderPeople(); renderInterestOptions(); renderTrash();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    contentTypeSwitching = false;
+    buttons.forEach(button => { button.disabled = false; });
+  }
 }
 
 function recommendationValues(form) {
@@ -792,17 +826,19 @@ async function addModalRecommendation(index, action, button) {
   const items = state.backlogRecommendMode === "llm" ? state.llmItems : state.apiItems;
   const source = items[index];
   if (!source) return;
-  if (action === "remove") {
-    const outcome = await cardActionWithFeedback(button, () => true, {exit:true});
-    if (!outcome) return;
-    items.splice(index, 1);
-    if (state.backlogRecommendMode === "llm") renderLlmRecommendations(); else renderApiRecommendations();
-    return;
-  }
-  const payload = {...source};
-  if (action === "backlog") { payload.status = "backlog"; payload.reaction = ""; }
-  else { payload.status = "consumed"; payload.reaction = action; }
+  const unlockTable = lockActionTable(button);
+  if (!unlockTable) return;
   try {
+    if (action === "remove") {
+      const outcome = await cardActionWithFeedback(button, () => true, {exit:true});
+      if (!outcome) return;
+      items.splice(index, 1);
+      if (state.backlogRecommendMode === "llm") renderLlmRecommendations(); else renderApiRecommendations();
+      return;
+    }
+    const payload = {...source};
+    if (action === "backlog") { payload.status = "backlog"; payload.reaction = ""; }
+    else { payload.status = "consumed"; payload.reaction = action; }
     const outcome = await cardActionWithFeedback(button, () => request(
       "/api/library", {method:"POST", body:JSON.stringify(payload)},
     ), {exit:true});
@@ -813,12 +849,15 @@ async function addModalRecommendation(index, action, button) {
     renderLibrary();
     toast(action === "backlog" ? "Добавлено в бэклог" : "Добавлено в просмотренное");
   } catch (error) { toast(error.message); }
+  finally { unlockTable(); }
 }
 
 async function addFilteredRecommendation(index, button) {
   const records = currentFilteredRecommendations();
   const source = records[index]?.item;
   if (!source) return;
+  const unlockTable = lockActionTable(button);
+  if (!unlockTable) return;
   try {
     const outcome = await cardActionWithFeedback(button, () => request(
       "/api/library",
@@ -832,6 +871,7 @@ async function addFilteredRecommendation(index, button) {
     renderLibrary();
     toast("Добавлено в бэклог");
   } catch (error) { toast(error.message); }
+  finally { unlockTable(); }
 }
 
 async function refreshTmdb() {
@@ -1265,6 +1305,8 @@ async function runPeopleRecommendation(event) {
 async function addRecommendedPerson(index, button) {
   const source = state.peopleRecommendationItems[index];
   if (!source) return;
+  const unlockTable = lockActionTable(button);
+  if (!unlockTable) return;
   try {
     const outcome = await cardActionWithFeedback(button, () => request(
       "/api/people", {method:"POST",body:JSON.stringify(source)},
@@ -1275,14 +1317,19 @@ async function addRecommendedPerson(index, button) {
     renderPeopleRecommendations(); renderPeople(); renderInterestOptions();
     toast(state.contentType === "music" ? "Исполнитель добавлен" : "Персона добавлена");
   } catch(error) { toast(error.message); }
+  finally { unlockTable(); }
 }
 
 async function removeRecommendedPerson(index, button) {
   if (!state.peopleRecommendationItems[index]) return;
-  const outcome = await cardActionWithFeedback(button, () => true, {exit:true});
-  if (!outcome) return;
-  state.peopleRecommendationItems.splice(index,1);
-  renderPeopleRecommendations();
+  const unlockTable = lockActionTable(button);
+  if (!unlockTable) return;
+  try {
+    const outcome = await cardActionWithFeedback(button, () => true, {exit:true});
+    if (!outcome) return;
+    state.peopleRecommendationItems.splice(index,1);
+    renderPeopleRecommendations();
+  } finally { unlockTable(); }
 }
 
 async function runBacklogApiRecommendation(event) {

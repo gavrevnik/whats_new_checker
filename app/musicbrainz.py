@@ -199,7 +199,7 @@ def artist_details(mbid: str) -> dict[str, Any]:
     raw = _request_json(
         f"artist/{mbid}", {"inc": "aliases+genres+tags+ratings+url-rels"}
     )
-    return _artist_payload(raw)
+    return {**_artist_payload(raw), "musicbrainz_checked": True}
 
 
 def enrich_artist_artwork(payload: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
@@ -396,6 +396,7 @@ def album_details(
             {"inc": "artists+releases+genres+tags"},
         )
         payload = _release_group_payload(raw)
+        payload["musicbrainz_checked"] = True
         best_release = _best_release(
             [item for item in raw.get("releases", []) if isinstance(item, dict)],
             str(raw.get("first-release-date") or ""),
@@ -467,17 +468,24 @@ def resolve_album_input(
 
 
 def _album_needs_refresh(target: dict[str, Any]) -> bool:
-    needs_musicbrainz = any(
-        field in target and target.get(field) in (None, "")
-        for field in (
-            "release_group_mbid", "musicbrainz_updated_at", "artists",
-            "first_release_date", "track_count", "primary_type",
-        )
+    needs_musicbrainz = (
+        not str(target.get("release_group_mbid") or "").strip()
+        or not str(target.get("musicbrainz_updated_at") or "").strip()
+    )
+    cover_path = str(target.get("cover_path") or "").strip()
+    cover_url = str(target.get("cover_url") or "").strip()
+    cover_checked = bool(str(target.get("cover_art_updated_at") or "").strip())
+    needs_cover = (
+        bool(cover_path or cover_url) and not artwork.is_cached(cover_path)
+    ) or (not cover_path and not cover_url and not cover_checked)
+    needs_popularity = (
+        target.get("total_listen_count") in (None, "")
+        and not str(target.get("listenbrainz_updated_at") or "").strip()
     )
     return (
         needs_musicbrainz
-        or not artwork.is_cached(target.get("cover_path"))
-        or target.get("total_listen_count") in (None, "")
+        or needs_cover
+        or needs_popularity
     )
 
 

@@ -179,6 +179,27 @@ class MusicBrainzTests(unittest.TestCase):
         self.assertEqual(result["updated"], 1)
         self.assertEqual(storage.get_item(missing["id"])["total_listen_count"], 321)
 
+    def test_album_refresh_skips_confirmed_missing_optional_data(self) -> None:
+        target = {
+            "release_group_mbid":"rg-empty",
+            "musicbrainz_updated_at":"checked",
+            "cover_url":"", "cover_path":"", "cover_art_updated_at":"checked",
+            "total_listen_count":None, "listenbrainz_updated_at":"checked",
+        }
+        with patch.object(musicbrainz.artwork, "is_cached", return_value=False):
+            self.assertFalse(musicbrainz._album_needs_refresh(target))
+
+    def test_album_refresh_repairs_missing_file_for_known_cover(self) -> None:
+        target = {
+            "release_group_mbid":"rg-cover",
+            "musicbrainz_updated_at":"checked",
+            "cover_url":"https://cover.test/rg-cover.jpg", "cover_path":"albums/rg-cover.jpg",
+            "cover_art_updated_at":"checked", "total_listen_count":None,
+            "listenbrainz_updated_at":"checked",
+        }
+        with patch.object(musicbrainz.artwork, "is_cached", return_value=False):
+            self.assertTrue(musicbrainz._album_needs_refresh(target))
+
     def test_refresh_artist_requests_musicbrainz_and_fanart(self) -> None:
         target = {
             "id":"artist-one", "name_original":"Portishead", "name_ru":"Portishead",
