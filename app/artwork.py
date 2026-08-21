@@ -3,6 +3,8 @@ from __future__ import annotations
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import urllib.error
 import urllib.request
@@ -16,6 +18,7 @@ MAX_IMAGE_BYTES = 15 * 1024 * 1024
 ALBUM_COVER_SIZE = 250
 MOVIE_POSTER_SIZE = "w185"
 PERSON_PROFILE_SIZE = "w185"
+FANART_ARTIST_WIDTH = 200
 
 
 class ArtworkError(RuntimeError):
@@ -64,7 +67,7 @@ def _safe_identifier(value: object) -> str:
 
 
 def _relative_path(kind: str, identifier: object) -> str:
-    folder = {"album": "albums", "movie": "movies", "person": "people"}.get(kind)
+    folder = {"album": "albums", "movie": "movies", "person": "people", "music_artist": "people"}.get(kind)
     if not folder:
         raise ArtworkError("Неизвестный тип изображения")
     return f"{folder}/{_safe_identifier(identifier)}.jpg"
@@ -102,7 +105,10 @@ def delete_cached(relative_path: object) -> bool:
         raise ArtworkError(f"Не удалось удалить локальное изображение: {error}") from error
 
 
-def _download(url: str, destination: Path) -> bool:
+def _download(
+    url: str, destination: Path, *, maximum_bytes: int = MAX_IMAGE_BYTES,
+    resize_width: int | None = None,
+) -> bool:
     if not url:
         return False
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -113,12 +119,24 @@ def _download(url: str, destination: Path) -> bool:
             content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0]
             if content_type and not content_type.startswith("image/"):
                 raise ArtworkError(f"Источник вернул не изображение ({content_type})")
-            body = response.read(MAX_IMAGE_BYTES + 1)
-            if len(body) > MAX_IMAGE_BYTES:
+            body = response.read(maximum_bytes + 1)
+            if len(body) > maximum_bytes:
                 raise ArtworkError("Файл изображения превышает допустимый размер")
-        handle, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+        handle, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.stem}.", suffix=destination.suffix, dir=destination.parent,
+        )
         with os.fdopen(handle, "wb") as stream:
             stream.write(body)
+        if resize_width:
+            sips = shutil.which("sips")
+            if not sips:
+                raise ArtworkError("Для уменьшения fanart.tv-изображений требуется системная утилита sips")
+            resized = subprocess.run(
+                [sips, "-Z", str(resize_width), temporary_name],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if resized.returncode:
+                raise ArtworkError("Не удалось уменьшить изображение fanart.tv")
         os.replace(temporary_name, destination)
         return True
     except urllib.error.HTTPError as error:
@@ -126,7 +144,7 @@ def _download(url: str, destination: Path) -> bool:
         if error.code == 404:
             return False
         raise ArtworkError(f"Не удалось загрузить изображение: HTTP {error.code}") from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
+    except (urllib.error.URLError, TimeoutError, subprocess.TimeoutExpired, OSError) as error:
         raise ArtworkError(f"Не удалось загрузить изображение: {error}") from error
     finally:
         if temporary_name:
@@ -162,6 +180,19 @@ def cache_person_profile(
     if destination.is_file() and not force:
         return relative
     return relative if _download(person_profile_url(profile_url or profile_path), destination) else ""
+
+
+def cache_music_artist_profile(
+    mbid: object, profile_url: str = "", *, force: bool = False,
+) -> str:
+    relative = _relative_path("music_artist", f"music-{mbid}")
+    destination = resolve_local_path(relative)
+    if destination.is_file() and not force:
+        return relative
+    return relative if _download(
+        str(profile_url or "").strip(), destination, maximum_bytes=2 * 1024 * 1024,
+        resize_width=FANART_ARTIST_WIDTH,
+    ) else ""
 
 
 def content_type(relative_path: str) -> str:

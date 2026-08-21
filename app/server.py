@@ -17,12 +17,12 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import artwork, listenbrainz, llm, musicbrainz, recommendation_progress, storage, tmdb
+from app import artwork, fanart, listenbrainz, llm, musicbrainz, recommendation_progress, storage, tmdb
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PID_FILE = Path(__file__).resolve().parents[1] / ".runtime" / "server.pid"
-APP_VERSION = 40
+APP_VERSION = 47
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -75,6 +75,7 @@ class Handler(BaseHTTPRequestHandler):
                     "content_types": storage.list_content_types(),
                     "tmdb": tmdb.configuration(),
                     "musicbrainz": musicbrainz.configuration(),
+                    "fanart": fanart.configuration(),
                     "listenbrainz": listenbrainz.configuration(),
                     "llm": llm.configuration(),
                 }
@@ -111,21 +112,35 @@ class Handler(BaseHTTPRequestHandler):
         content_type, item_id = parts[2], parts[3]
         try:
             if content_type == "person":
-                person = storage.get_interest_person(item_id)
+                try:
+                    person = storage.get_interest_person(item_id)
+                except storage.StorageError:
+                    person = storage.get_music_artist(item_id)
+                is_music_artist = person.get("content_type") == "music"
                 relative = str(person.get("profile_local_path") or "")
                 if not artwork.is_cached(relative):
-                    relative = artwork.cache_person_profile(
-                        person.get("tmdb_id"), str(person.get("profile_path") or ""),
-                        str(person.get("profile_url") or ""),
+                    relative = (
+                        artwork.cache_music_artist_profile(
+                            person.get("mbid"), str(person.get("profile_url") or ""),
+                        )
+                        if is_music_artist else artwork.cache_person_profile(
+                            person.get("tmdb_id"), str(person.get("profile_path") or ""),
+                            str(person.get("profile_url") or ""),
+                        )
                     )
                 if not relative:
                     self._error("Изображение отсутствует", HTTPStatus.NOT_FOUND)
                     return
                 if relative != person.get("profile_local_path"):
-                    storage.update_person_artwork_path(
-                        item_id, relative, str(person.get("profile_path") or ""),
-                        artwork.person_profile_url(str(person.get("profile_url") or person.get("profile_path") or "")),
-                    )
+                    if is_music_artist:
+                        storage.update_music_artist_artwork_path(
+                            item_id, relative, str(person.get("profile_url") or ""),
+                        )
+                    else:
+                        storage.update_person_artwork_path(
+                            item_id, relative, str(person.get("profile_path") or ""),
+                            artwork.person_profile_url(str(person.get("profile_url") or person.get("profile_path") or "")),
+                        )
                 self._serve_artwork_file(relative)
                 return
             item = storage.get_item(item_id)
@@ -179,8 +194,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"item": tmdb.resolve_movie_input(payload)})
                 return
             if parsed.path == "/api/resolve/person":
-                resolver = musicbrainz.resolve_artist_input if payload.get("content_type") == "music" else tmdb.resolve_person_input
-                self._json({"item": resolver(payload)})
+                item = (
+                    musicbrainz.resolve_artist_input(payload, include_artwork=True)
+                    if payload.get("content_type") == "music"
+                    else tmdb.resolve_person_input(payload)
+                )
+                self._json({"item": item})
                 return
             if parsed.path == "/api/resolve/album":
                 self._json({"item": musicbrainz.resolve_album_input(payload)})
@@ -234,6 +253,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"item": musicbrainz.refresh_album(item_id)})
                 return
             if parsed.path == "/api/people":
+                if payload.get("content_type") == "music":
+                    raw_data = payload.get("raw_data") or dict(payload)
+                    payload = (
+                        musicbrainz.enrich_artist_artwork(payload)
+                        if payload.get("mbid") or payload.get("external_id")
+                        else musicbrainz.resolve_artist_input(payload, include_artwork=True)
+                    )
+                    payload["raw_data"] = raw_data
                 self._json({"item": storage.add_interest_person(payload)}, HTTPStatus.CREATED)
                 return
             if parsed.path == "/api/people/refresh-tmdb":

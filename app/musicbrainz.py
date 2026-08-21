@@ -10,7 +10,7 @@ import urllib.request
 from datetime import date
 from typing import Any
 
-from app import artwork, listenbrainz, recommendation_progress, storage
+from app import artwork, fanart, listenbrainz, recommendation_progress, storage
 
 
 BASE_URL = "https://musicbrainz.org/ws/2"
@@ -202,14 +202,32 @@ def artist_details(mbid: str) -> dict[str, Any]:
     return _artist_payload(raw)
 
 
-def resolve_artist_input(payload: dict[str, Any]) -> dict[str, Any]:
+def enrich_artist_artwork(payload: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    result = dict(payload)
+    mbid = str(result.get("mbid") or result.get("external_id") or "").strip()
+    if not mbid or (artwork.is_cached(result.get("profile_local_path")) and not force):
+        return result
+    try:
+        return fanart.enrich_artist_artwork(result, force=force)
+    except (fanart.FanartError, artwork.ArtworkError) as error:
+        result.setdefault("provider_warnings", []).append({
+            "provider": "fanart.tv", "message": str(error),
+        })
+        return result
+
+
+def resolve_artist_input(
+    payload: dict[str, Any], *, include_artwork: bool = False,
+) -> dict[str, Any]:
     mbid = str(payload.get("mbid") or payload.get("external_id") or "").strip()
     if mbid:
-        return artist_details(mbid)
-    found = search_artist(
-        str(payload.get("name") or payload.get("name_original") or payload.get("name_ru") or "")
-    )
-    return artist_details(found["mbid"])
+        details = artist_details(mbid)
+    else:
+        found = search_artist(
+            str(payload.get("name") or payload.get("name_original") or payload.get("name_ru") or "")
+        )
+        details = artist_details(found["mbid"])
+    return enrich_artist_artwork(details) if include_artwork else details
 
 
 def _artist_credits(raw: dict[str, Any]) -> list[dict[str, Any]]:
@@ -448,15 +466,26 @@ def resolve_album_input(
     return album_details(mbid, fetch_popularity=fetch_popularity)
 
 
+def _album_needs_refresh(target: dict[str, Any]) -> bool:
+    needs_musicbrainz = any(
+        field in target and target.get(field) in (None, "")
+        for field in (
+            "release_group_mbid", "musicbrainz_updated_at", "artists",
+            "first_release_date", "track_count", "primary_type",
+        )
+    )
+    return (
+        needs_musicbrainz
+        or not artwork.is_cached(target.get("cover_path"))
+        or target.get("total_listen_count") in (None, "")
+    )
+
+
 def refresh_album(item_id: str) -> dict[str, Any]:
     target = storage.get_item(item_id)
     if target.get("content_type") != "music":
         raise MusicBrainzError("Album not found")
-    needs_refresh = (
-        not target.get("artists")
-        or not artwork.is_cached(target.get("cover_path"))
-        or target.get("total_listen_count") in (None, "")
-    )
+    needs_refresh = _album_needs_refresh(target)
     warnings: list[dict[str, str]] = []
     item = target
     if not needs_refresh:
@@ -481,8 +510,7 @@ def refresh_album(item_id: str) -> dict[str, Any]:
 def refresh_library(progress_id: object = None) -> dict[str, Any]:
     targets = [
         target for target in storage.album_refresh_targets()
-        if not target.get("artists") or not artwork.is_cached(target.get("cover_path"))
-        or target.get("total_listen_count") in (None, "")
+        if _album_needs_refresh(target)
     ]
     updated_ids: set[str] = set()
     errors: list[dict[str, str]] = []
@@ -545,8 +573,11 @@ def refresh_artist(artist_id: str) -> dict[str, Any]:
     )
     if not target:
         raise MusicBrainzError("Artist not found")
-    details = resolve_artist_input(target)
-    return storage.update_music_artist(artist_id, details)
+    details = resolve_artist_input(target, include_artwork=True)
+    item = storage.update_music_artist(artist_id, details)
+    if details.get("provider_warnings"):
+        item["provider_warnings"] = details["provider_warnings"]
+    return item
 
 
 def refresh_artists() -> dict[str, Any]:
@@ -651,12 +682,13 @@ def recommend_albums(filters: dict[str, Any]) -> dict[str, Any]:
                 secondary = {str(value).casefold() for value in item.get("secondary_types", [])}
                 if mbid in known_ids or normalized in known_titles:
                     continue
+                item_year = item.get("year")
+                if not item_year or not year_from <= int(item_year) <= year_to:
+                    # The year range is the discovery period, not a rejection reason shown to users.
+                    continue
                 reasons: list[str] = []
                 if not mbid:
                     reasons.append("MusicBrainz ID недоступен")
-                item_year = item.get("year")
-                if not item_year or not year_from <= int(item_year) <= year_to:
-                    reasons.append(f"год выпуска вне диапазона {year_from}–{year_to} или недоступен")
                 primary_type = str(item.get("primary_type") or "")
                 if primary_type and primary_type.casefold() != "album":
                     reasons.append("основной тип релиза не Album")

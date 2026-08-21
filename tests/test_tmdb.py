@@ -143,12 +143,20 @@ class TmdbTests(unittest.TestCase):
         payload = {
             "id":514, "name":"Jack Nicholson", "also_known_as":["Джек Николсон"],
             "birthday":"1937-04-22", "place_of_birth":"Neptune City", "known_for_department":"Acting",
+            "external_ids":{"imdb_id":"nm0000197"},
         }
-        with patch.object(tmdb,"_get",return_value=payload):
+        with patch.object(tmdb,"_get",return_value=payload) as fetch:
             result = tmdb.person_details(514,"key")
         self.assertEqual(result["name_original"],"Jack Nicholson")
         self.assertEqual(result["name_ru"],"Джек Николсон")
+        self.assertEqual(result["imdb_id"],"nm0000197")
+        self.assertEqual(result["details_json"]["imdb_id"],"nm0000197")
+        self.assertTrue(result["details_json"]["external_ids_checked"])
         self.assertEqual(result["details_json"]["birthday"],"1937-04-22")
+        self.assertEqual(
+            fetch.call_args_list[0].args,
+            ("/person/514", {"language":"en-US", "append_to_response":"external_ids"}, "key"),
+        )
 
     def test_person_details_caches_small_tmdb_profile(self) -> None:
         payload = {
@@ -219,7 +227,7 @@ class TmdbTests(unittest.TestCase):
 
     def test_bulk_people_refresh_updates_people_without_tmdb_id_or_cached_profile(self) -> None:
         targets = [
-            {"id":"known","name_original":"Known","name_ru":"Известный","role":"actor","tmdb_id":10,"external_id":10,"tmdb_updated_at":"2026-01-01","profile_path":"","profile_url":"","profile_local_path":""},
+            {"id":"known","name_original":"Known","name_ru":"Известный","role":"actor","tmdb_id":10,"external_id":10,"tmdb_updated_at":"2026-01-01","profile_path":"","profile_url":"","profile_local_path":"","details_json":"{\"imdb_id\":\"nm10\"}"},
             {"id":"missing","name_original":"Missing","name_ru":"Без ID","role":"director","tmdb_id":"","external_id":""},
         ]
         details = {"tmdb_id":20,"name_original":"Missing","name_ru":"Без ID","details_json":{}}
@@ -232,12 +240,21 @@ class TmdbTests(unittest.TestCase):
         save.assert_called_once_with("missing", details)
         self.assertEqual(result, {"total":1,"updated":1,"failed":0,"errors":[]})
 
+    def test_person_without_imdb_id_is_not_rechecked_after_external_ids_lookup(self) -> None:
+        target = {
+            "tmdb_id":10, "tmdb_updated_at":"2026-01-01", "profile_path":"",
+            "profile_url":"", "profile_local_path":"",
+            "details_json":{"imdb_id":"", "external_ids_checked":True},
+        }
+        self.assertFalse(tmdb._person_needs_refresh(target))
+
     def test_bulk_people_refresh_recaches_known_person_with_missing_profile_file(self) -> None:
         target = {
             "id":"known", "name_original":"Known", "name_ru":"Известный", "role":"actor",
             "tmdb_id":10, "external_id":10, "tmdb_updated_at":"2026-01-01",
             "profile_path":"/known.jpg", "profile_url":"https://image.tmdb.org/t/p/w185/known.jpg",
             "profile_local_path":"people/10.jpg",
+            "details_json":{"imdb_id":"nm10"},
         }
         details = {"tmdb_id":10,"name_original":"Known","name_ru":"Известный","details_json":{}}
         with patch.object(tmdb,"get_api_key",return_value=("key","test")), \
@@ -285,6 +302,25 @@ class TmdbTests(unittest.TestCase):
         imdb.assert_not_called()
         kinopoisk.assert_called_once_with("tt0133093", "The Matrix", "Матрица", 1999)
         save.assert_called_once_with("movie-one", kp)
+
+    def test_refresh_movie_runs_tmdb_when_card_metadata_is_missing(self) -> None:
+        target = {
+            "id":"movie-one", "title_original":"The Matrix", "title_ru":"Матрица",
+            "year":1999, "release_date":"1999-03-31", "tmdb_id":603,
+            "tmdb_updated_at":"2026-01-01T00:00:00+00:00", "imdb_id":"tt0133093",
+            "imdb_rating":8.7, "kinopoisk_rating":8.5, "directors":"Lana Wachowski",
+            "duration_minutes":136, "genres":"фантастика", "overview":"", "cast":"Keanu Reeves",
+            "poster_local_path":"movies/603.jpg",
+        }
+        details = {**target, "overview":"A computer hacker learns the truth."}
+        with patch.object(tmdb.storage,"get_item",return_value=target), \
+             patch.object(tmdb.artwork,"is_cached",return_value=True), \
+             patch.object(tmdb,"get_api_key",return_value=("key","test")), \
+             patch.object(tmdb,"movie_details",return_value=details) as fetch, \
+             patch.object(tmdb.storage,"update_movie_from_provider",return_value=details) as save:
+            tmdb.refresh_movie("movie-one")
+        fetch.assert_called_once_with(603, "key", fetch_kinopoisk=False)
+        save.assert_called_once_with("movie-one", details)
 
     def test_refresh_movie_skips_all_providers_when_both_ratings_exist(self) -> None:
         target = {"id":"movie-one", "imdb_rating":8.7, "kinopoisk_rating":8.5, "directors":"Director", "poster_local_path":"movies/1.jpg"}
@@ -349,7 +385,7 @@ class TmdbTests(unittest.TestCase):
         self.assertEqual([item["tmdb_id"] for item in result["items"]], [3])
         self.assertEqual(
             {record["item"]["tmdb_id"] for record in result["filtered_items"]},
-            {1, 2, 4},
+            {1, 2},
         )
         enrich.assert_called_once_with(3, "key")
 

@@ -435,7 +435,11 @@ def person_details(tmdb_id: int, api_key: str | None = None) -> dict[str, Any]:
     api_key = api_key or get_api_key()[0]
     if not api_key:
         raise TmdbError("TMDB_API_KEY is not configured")
-    details = _get(f"/person/{tmdb_id}", {"language": "en-US"}, api_key)
+    details = _get(
+        f"/person/{tmdb_id}",
+        {"language": "en-US", "append_to_response": "external_ids"},
+        api_key,
+    )
     localized = _get(f"/person/{tmdb_id}", {"language": "ru-RU"}, api_key)
     aliases = details.get("also_known_as", []) if isinstance(details.get("also_known_as"), list) else []
     original_name = str(details.get("name") or "").strip()
@@ -444,8 +448,11 @@ def person_details(tmdb_id: int, api_key: str | None = None) -> dict[str, Any]:
     localized_name = str(localized.get("name") or "").strip()
     profile_path = str(details.get("profile_path") or "")
     profile_url = artwork.person_profile_url(profile_path)
+    external_ids = details.get("external_ids") if isinstance(details.get("external_ids"), dict) else {}
+    imdb_id = str(external_ids.get("imdb_id") or "").strip()
     payload = {
         "tmdb_id": int(details["id"]),
+        "imdb_id": imdb_id,
         "name_original": original_name,
         "name_ru": localized_name if re.search(r"[А-Яа-яЁё]", localized_name) else (_cyrillic_alias(aliases) or original_name),
         "profile_path": profile_path,
@@ -460,6 +467,8 @@ def person_details(tmdb_id: int, api_key: str | None = None) -> dict[str, Any]:
             "profile_url": profile_url,
             "profile_checked": True,
             "known_for_department": str(details.get("known_for_department") or ""),
+            "imdb_id": imdb_id,
+            "external_ids_checked": True,
         },
     }
     if profile_path:
@@ -534,6 +543,16 @@ def _person_needs_refresh(target: dict[str, Any]) -> bool:
         return True
     if not str(target.get("tmdb_updated_at") or "").strip():
         return True
+    metadata = target.get("details_json")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+    if not isinstance(metadata, dict):
+        return True
+    if not str(metadata.get("imdb_id") or "").strip() and metadata.get("external_ids_checked") is not True:
+        return True
     return bool(target.get("profile_path") or target.get("profile_url")) and not artwork.is_cached(
         target.get("profile_local_path")
     )
@@ -547,7 +566,10 @@ def refresh_person(person_id: str) -> dict[str, Any]:
     if not target:
         raise TmdbError("Person not found")
     target_id, details = _fetch_person_target(target, api_key)
-    return storage.update_interest_person(target_id, details)
+    item = storage.update_interest_person(target_id, details)
+    if details.get("provider_warnings"):
+        item["provider_warnings"] = details["provider_warnings"]
+    return item
 
 
 def refresh_people() -> dict[str, Any]:
@@ -664,10 +686,17 @@ def _movie_rating_details(target: dict[str, Any]) -> dict[str, Any]:
 
 
 def _needs_movie_refresh(target: dict[str, Any]) -> bool:
+    needs_tmdb = any(
+        field in target and target.get(field) in (None, "")
+        for field in (
+            "tmdb_updated_at", "tmdb_id", "release_date", "duration_minutes",
+            "directors", "genres", "overview", "cast",
+        )
+    )
     return (
-        target.get("imdb_rating") in (None, "")
+        needs_tmdb
+        or target.get("imdb_rating") in (None, "")
         or target.get("kinopoisk_rating") in (None, "")
-        or not str(target.get("directors") or "").strip()
         or not artwork.is_cached(target.get("poster_local_path"))
     )
 
@@ -702,12 +731,18 @@ def _poster_details(target: dict[str, Any]) -> dict[str, Any]:
 def _refresh_movie_target(target: dict[str, Any]) -> dict[str, Any]:
     item_id = str(target["id"])
     needs_imdb = target.get("imdb_rating") in (None, "")
-    needs_director = not str(target.get("directors") or "").strip()
+    needs_tmdb = any(
+        field in target and target.get(field) in (None, "")
+        for field in (
+            "tmdb_updated_at", "tmdb_id", "release_date", "duration_minutes",
+            "directors", "genres", "overview", "cast",
+        )
+    )
     needs_kinopoisk = target.get("kinopoisk_rating") in (None, "")
     needs_poster = not artwork.is_cached(target.get("poster_local_path"))
     warnings: list[dict[str, str]] = []
 
-    if needs_imdb or needs_director:
+    if needs_imdb or needs_tmdb:
         api_key, _ = get_api_key()
         if not api_key:
             raise TmdbError("TMDB_API_KEY is not configured")
@@ -870,9 +905,11 @@ def recommend_movies(filters: dict[str, Any]) -> dict[str, Any]:
                 release_date = str(row.get("release_date") or "")
                 if not movie_id or _known_recommendation_movie(row, known_ids, known_titles):
                     continue
-                reasons: list[str] = []
                 if not release_date or not (date_from <= release_date <= date_to):
-                    reasons.append(f"дата выхода вне диапазона {date_from[:4]}–{date_to[:4]} или недоступна")
+                    # The selected period defines the discovery window; items outside it are
+                    # intentionally absent from the user-facing rejection list.
+                    continue
+                reasons: list[str] = []
                 if excluded_genre_ids & {int(value) for value in row.get("genre_ids", []) if str(value).isdigit()}:
                     reasons.append("исключённый жанр")
                 vote_count = int(row.get("vote_count") or 0)

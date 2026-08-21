@@ -69,6 +69,20 @@ class LlmTests(unittest.TestCase):
         self.assertIn("Фильм 29 (Movie 29)", liked_section)
         self.assertNotIn("Фильм 30 (Movie 30)", liked_section)
 
+    def test_prompt_uses_configurable_random_sample_of_people(self) -> None:
+        people = [
+            {"name_ru":f"Персона {index}", "name_original":f"Person {index}", "role":"actor"}
+            for index in range(3)
+        ]
+        with patch.object(llm.storage, "list_interests", return_value=people), \
+             patch.object(llm.random, "sample", side_effect=lambda values, count: values[:count]):
+            prompt = llm.build_movie_prompt({"year_to":"2026", "people_sample_size":"2"})
+        people_section = prompt.split("Любимые актёры и режиссёры", 1)[1].split(
+            "Уже добавленные фильмы", 1
+        )[0]
+        self.assertIn("Персона 1 (Person 1)", people_section)
+        self.assertNotIn("Персона 2 (Person 2)", people_section)
+
     def test_movie_prompt_explicitly_excludes_trashed_movies(self) -> None:
         trashed = storage.add_item({
             "title_original":"Gone Movie", "title_ru":"Удалённый фильм", "year":"2022",
@@ -327,6 +341,35 @@ class LlmTests(unittest.TestCase):
         self.assertIn("Portishead", music_prompt)
         self.assertIn("Мрачный трип-хоп", music_prompt)
 
+    def test_people_prompt_applies_role_and_context_limit(self) -> None:
+        storage.add_interest_person({
+            "role":"actor", "name_original":"Tilda Swinton", "name_ru":"Тильда Суинтон",
+            "tmdb_id":3063,
+        })
+        storage.add_interest_person({
+            "role":"actor", "name_original":"Song Kang-ho", "name_ru":"Сон Кан-хо",
+            "tmdb_id":20738,
+        })
+        with patch.object(llm.random, "sample", side_effect=lambda values, count: values[:count]):
+            prompt = llm.build_people_prompt({
+                "content_type":"movie", "role":"actor", "people_sample_size":"1",
+                "prompt":"Характерные исполнители",
+            })
+        liked_section = prompt.split("Любимые актёры", 1)[1].split("Уже добавленные актёры", 1)[0]
+        self.assertIn("Задача: порекомендуй актёров", prompt)
+        self.assertIn("поле role должно быть равно actor", prompt)
+        self.assertIn("Сон Кан-хо (Song Kang-ho)", liked_section)
+        self.assertNotIn("Тильда Суинтон (Tilda Swinton)", liked_section)
+        self.assertNotIn("Дэвид Финчер (David Fincher)", prompt)
+
+    def test_people_response_must_match_selected_role(self) -> None:
+        response = json.dumps({"people":[{
+            "name_original":"Jane Campion", "name_ru":"Джейн Кэмпион",
+            "role":"director", "comment":"Авторское кино",
+        }]}, ensure_ascii=False)
+        with self.assertRaises(llm.LlmError):
+            llm._parse_people_response(response, "movie", "actor")
+
     def test_movie_person_recommendation_is_resolved_through_tmdb(self) -> None:
         response = {"people":[{
             "name_original":"Jane Campion", "name_ru":"Джейн Кэмпион",
@@ -365,11 +408,35 @@ class LlmTests(unittest.TestCase):
         }
         with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
              patch.object(llm, "_run_codex", return_value=completed), \
-             patch.object(llm.musicbrainz, "resolve_artist_input", return_value=details) as resolve:
-            result = llm.recommend_people({"content_type":"music", "prompt":"Трип-хоп"})
+             patch.object(llm.musicbrainz, "resolve_artist_input", return_value=details) as resolve, \
+             patch.object(
+                 llm.musicbrainz, "enrich_artist_artwork",
+                 side_effect=lambda artist: {
+                     **artist, "profile_url":"https://fanart.test/massive-attack.jpg",
+                 },
+             ) as enrich:
+            result = llm.recommend_people({
+                "content_type":"music", "prompt":"Трип-хоп", "progress_id":"people-music-job",
+            })
         self.assertEqual(result["items"][0]["mbid"], "artist-massive-attack")
+        self.assertEqual(result["items"][0]["profile_url"], "https://fanart.test/massive-attack.jpg")
         self.assertEqual(result["items"][0]["role"], "artist")
         resolve.assert_called_once_with({"content_type":"music", "name":"Massive Attack"})
+        enrich.assert_called_once()
+        progress = llm.recommendation_progress.get("people-music-job")
+        self.assertEqual(
+            [stage["id"] for stage in progress["stages"]],
+            ["llm-request", "musicbrainz-people", "fanart-people"],
+        )
+        self.assertEqual(
+            [stage["label"] for stage in progress["stages"]],
+            [
+                "Codex · запрос к LLM",
+                "MusicBrainz · карточки исполнителей",
+                "fanart.tv · фотографии исполнителей",
+            ],
+        )
+        self.assertTrue(all(stage["complete"] for stage in progress["stages"]))
 
 
 if __name__ == "__main__":

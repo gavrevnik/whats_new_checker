@@ -87,6 +87,8 @@ class StorageTests(unittest.TestCase):
             self.assertIn("listenbrainz_updated_at", album_columns)
             self.assertNotIn("rating", album_columns)
             self.assertNotIn("rating_votes", album_columns)
+            artist_columns = {row[1] for row in connection.execute("PRAGMA table_info(music_artists)")}
+            self.assertTrue({"profile_url", "profile_local_path", "fanart_updated_at"} <= artist_columns)
 
     def test_album_artist_workflow_and_trash_restore(self) -> None:
         artist = storage.add_music_artist({
@@ -178,11 +180,21 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(next(item for item in listed if item["id"] == created["id"])["favorite"])
         self.assertFalse(storage.set_favorite(created["id"], False)["favorite"])
 
-    def test_artist_refresh_targets_include_only_artists_without_musicbrainz_id(self) -> None:
-        storage.add_music_artist({"name":"Known Artist", "mbid":"known-artist"})
+    def test_artist_refresh_targets_exclude_complete_artists(self) -> None:
+        storage.add_music_artist({
+            "name":"Known Artist", "mbid":"known-artist",
+            "profile_local_path":"people/music-known-artist.jpg",
+            "musicbrainz_updated_at":"2026-01-01T00:00:00+00:00",
+        })
         missing = storage.add_music_artist({"name":"Unknown Artist"})
-        targets = storage.artist_refresh_targets()
+        with patch.object(artwork, "is_cached", side_effect=lambda path: bool(path)):
+            targets = storage.artist_refresh_targets()
         self.assertEqual([target["id"] for target in targets], [missing["id"]])
+
+    def test_artist_refresh_targets_include_missing_fanart(self) -> None:
+        artist = storage.add_music_artist({"name":"Known Artist", "mbid":"known-artist"})
+        targets = storage.artist_refresh_targets()
+        self.assertEqual([target["id"] for target in targets], [artist["id"]])
 
     def test_people_can_be_added_and_refreshed(self) -> None:
         created = storage.add_interest_person({

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import artwork, storage
+from app import artwork, fanart, storage
 
 
 def _cache(item: dict, refresh_existing: bool = False) -> tuple[str, str, str]:
@@ -24,6 +24,11 @@ def _cache(item: dict, refresh_existing: bool = False) -> tuple[str, str, str]:
                 item.get("tmdb_id"), str(item.get("profile_path") or ""),
                 str(item.get("profile_url") or ""), force=refresh_existing,
             )
+        elif artwork_kind == "music_artist":
+            if not item.get("mbid"):
+                return str(item["id"]), "skipped", "нет MusicBrainz ID"
+            enriched = fanart.enrich_artist_artwork(item, force=refresh_existing)
+            relative = str(enriched.get("profile_local_path") or "")
         elif content_type == "music":
             relative = artwork.cache_album_cover(
                 str(item.get("release_group_mbid") or ""), str(item.get("cover_url") or ""),
@@ -39,7 +44,7 @@ def _cache(item: dict, refresh_existing: bool = False) -> tuple[str, str, str]:
         if not relative:
             return str(item["id"]), "skipped", "обложка отсутствует у провайдера"
         stored_relative = str(item.get(
-            "profile_local_path" if artwork_kind == "person" else
+            "profile_local_path" if artwork_kind in {"person", "music_artist"} else
             "cover_path" if content_type == "music" else "poster_local_path"
         ) or "")
         normalized_profile_url = artwork.person_profile_url(
@@ -49,6 +54,10 @@ def _cache(item: dict, refresh_existing: bool = False) -> tuple[str, str, str]:
             if artwork_kind == "person":
                 storage.update_person_artwork_path(
                     str(item["id"]), relative, str(item.get("profile_path") or ""), normalized_profile_url,
+                )
+            elif artwork_kind == "music_artist":
+                storage.update_music_artist_artwork_path(
+                    str(item["id"]), relative, str(enriched.get("profile_url") or ""),
                 )
             else:
                 storage.update_artwork_path(str(item["id"]), content_type, relative)
@@ -61,7 +70,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cache movie posters and album covers locally")
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument(
-        "--kind", choices=("all", "movies", "albums", "people"), default="all",
+        "--kind", choices=("all", "movies", "albums", "people", "artists"), default="all",
         help="Limit caching to one artwork group",
     )
     parser.add_argument(
@@ -79,6 +88,11 @@ def main() -> None:
         for person in storage.list_interests("movie", include_trashed=True):
             people.setdefault(str(person["id"]), {**person, "artwork_kind": "person"})
     items.extend(people.values())
+    if args.kind in {"all", "artists"}:
+        items.extend(
+            {**artist, "artwork_kind": "music_artist"}
+            for artist in storage.list_music_artists(include_trashed=True)
+        )
     results = []
     with ThreadPoolExecutor(max_workers=max(1, min(args.workers, 12))) as executor:
         futures = [executor.submit(_cache, item, args.refresh_existing) for item in items]

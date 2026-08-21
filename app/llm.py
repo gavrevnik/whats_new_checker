@@ -152,7 +152,6 @@ def build_movie_prompt(payload: dict[str, Any]) -> str:
     year_from = int(year_from_raw) if year_from_raw is not None else None
     year_to = int(year_to_raw) if year_to_raw is not None else None
     min_runtime = int(runtime_raw) if runtime_raw is not None else None
-    liked_sample_size = int(_number(payload, "liked_sample_size", 30, 0, 200))
     limit_raw = _optional_number(payload, "limit", 5, 1, 20)
     limit = int(limit_raw) if limit_raw is not None else None
     if year_from is not None and year_to is not None and year_from > year_to:
@@ -163,10 +162,20 @@ def build_movie_prompt(payload: dict[str, Any]) -> str:
 
     movies = storage.list_library(content_type="movie")
     liked_movies = [item for item in movies if item.get("status") == "consumed" and item.get("reaction") == "like"]
+    liked_sample_size = int(_number(
+        payload, "liked_sample_size", len(liked_movies), 0, max(10_000, len(liked_movies)),
+    ))
     liked = [_movie_line(item) for item in _sample_context(liked_movies, liked_sample_size, payload)]
     existing_movies = storage.list_library(content_type="movie", include_trashed=True)
     exclusions = [_movie_line(item) for item in existing_movies]
-    people = [_person_line(person) for person in storage.list_interests("movie")]
+    interest_people = storage.list_interests("movie")
+    people_sample_size = int(_number(
+        payload, "people_sample_size", len(interest_people), 0, max(10_000, len(interest_people)),
+    ))
+    people = [
+        _person_line(person)
+        for person in _sample_context(interest_people, people_sample_size, payload)
+    ]
     user_block = user_prompt or "Дополнительных пожеланий нет — подбери наиболее релевантные фильмы по профилю вкусов."
 
     filters = []
@@ -451,7 +460,6 @@ def build_album_prompt(payload: dict[str, Any]) -> str:
     year_to = int(year_to_raw) if year_to_raw is not None else None
     if year_from is not None and year_to is not None and year_from > year_to:
         raise LlmError("Начальный год не может быть больше конечного")
-    liked_sample_size = int(_number(payload, "liked_sample_size", 30, 0, 200))
     limit_raw = _optional_number(payload, "limit", 5, 1, 20)
     limit = int(limit_raw) if limit_raw is not None else 10
     user_prompt = str(payload.get("prompt") or "").strip()
@@ -462,10 +470,20 @@ def build_album_prompt(payload: dict[str, Any]) -> str:
         item for item in albums
         if item.get("status") == "consumed" and item.get("reaction") == "like"
     ]
+    liked_sample_size = int(_number(
+        payload, "liked_sample_size", len(liked_albums), 0, max(10_000, len(liked_albums)),
+    ))
     liked = [_album_line(item) for item in _sample_context(liked_albums, liked_sample_size, payload)]
     existing_albums = storage.list_library(content_type="music", include_trashed=True)
     exclusions = [_album_line(item) for item in existing_albums]
-    artists = [_artist_line(item) for item in storage.list_music_artists()]
+    interest_artists = storage.list_music_artists()
+    people_sample_size = int(_number(
+        payload, "people_sample_size", len(interest_artists), 0, max(10_000, len(interest_artists)),
+    ))
+    artists = [
+        _artist_line(item)
+        for item in _sample_context(interest_artists, people_sample_size, payload)
+    ]
     filters = []
     if year_from is not None and year_to is not None:
         filters.append(f"- первый выпуск альбома с {year_from} по {year_to} год включительно")
@@ -661,7 +679,11 @@ def build_people_prompt(payload: dict[str, Any]) -> str:
     if len(user_prompt) > 8000:
         raise LlmError("Пользовательский промпт слишком длинный")
     limit = int(_number(payload, "limit", 5, 1, 20))
-    existing = storage.list_interests(content_type, include_trashed=True)
+    selected_role = str(payload.get("role") or "").strip() if content_type == "movie" else "artist"
+    if content_type == "movie" and selected_role not in {"", "actor", "director"}:
+        raise LlmError("Тип рекомендации должен быть actor или director")
+    role_filter = selected_role or None
+    existing = storage.list_interests(content_type, role_filter, include_trashed=True)
     existing_lines = [
         _artist_line(person) if content_type == "music" else _person_line(person)
         for person in existing
@@ -672,29 +694,52 @@ def build_people_prompt(payload: dict[str, Any]) -> str:
             "Для каждой рекомендации укажи каноническое имя в name_original, наиболее употребимое "
             "русское написание в name_ru, role=artist и короткий содержательный comment на русском."
         )
-        entity_label = "исполнителей"
+        task_entity_label = "исполнителей"
+        list_entity_label = "исполнители"
         format_note = "Для всех элементов поле role должно быть равно artist."
     else:
+        role_settings = {
+            "actor": ("актёров", "актёры", "actor"),
+            "director": ("режиссёров", "режиссёры", "director"),
+            "": ("актёров и режиссёров", "актёры и режиссёры", "actor или director"),
+        }
+        task_entity_label, list_entity_label, role_note = role_settings[selected_role]
         task = (
-            "Задача: порекомендуй актёров и/или режиссёров по запросу пользователя. Для каждой рекомендации "
-            "укажи оригинальное имя в name_original, наиболее употребимое русское имя в name_ru, роль actor "
-            "или director и короткий содержательный comment на русском."
+            f"Задача: порекомендуй {task_entity_label} по запросу пользователя. Для каждой рекомендации "
+            f"укажи оригинальное имя в name_original, наиболее употребимое русское имя в name_ru, роль {role_note} "
+            "и короткий содержательный comment на русском."
         )
-        entity_label = "персон"
-        format_note = "Поле role должно быть actor для актёра или director для режиссёра."
+        format_note = (
+            f"Для всех элементов поле role должно быть равно {selected_role}."
+            if selected_role else
+            "Поле role должно быть actor для актёра или director для режиссёра."
+        )
+        active_people = storage.list_interests("movie", role_filter)
+        people_sample_size = int(_number(
+            payload, "people_sample_size", len(active_people), 0, max(10_000, len(active_people)),
+        ))
+        liked_people_lines = [
+            _person_line(person)
+            for person in _sample_context(active_people, people_sample_size, payload)
+        ]
     user_block = user_prompt or "Дополнительных пожеланий нет — подбери наиболее релевантные рекомендации."
-    return "\n\n".join([
+    sections = [
         task,
         f"Верни не более {limit} наиболее релевантных позиций. Не предлагай никого из уже добавленных списков, "
         "включая объекты в корзине. Не заменяй уже добавленную персону вариантом написания того же имени.",
         f"Свободный запрос пользователя:\n{user_block}",
-        _section(
-            f"Уже добавленные {entity_label}, включая корзину — не рекомендовать повторно",
-            existing_lines,
-        ),
+    ]
+    if content_type == "movie":
+        sections.append(_section(
+            f"Любимые {list_entity_label} (используй как мягкий сигнал вкуса)",
+            liked_people_lines,
+        ))
+    sections.extend([
+        _section(f"Уже добавленные {list_entity_label}, включая корзину — не рекомендовать повторно", existing_lines),
         "Формат ответа задаётся JSON Schema. Верни только JSON-объект с массивом people. "
         f"{format_note} Не добавляй Markdown, вступление или вопросы пользователю.",
     ])
+    return "\n\n".join(sections)
 
 
 def build_people_recommendation_prompt(payload: dict[str, Any]) -> str:
@@ -705,7 +750,9 @@ def build_people_recommendation_prompt(payload: dict[str, Any]) -> str:
     )
 
 
-def _parse_people_response(raw: str, content_type: str) -> list[dict[str, str]]:
+def _parse_people_response(
+    raw: str, content_type: str, selected_role: str = "",
+) -> list[dict[str, str]]:
     try:
         response = json.loads(raw)
     except json.JSONDecodeError as error:
@@ -714,7 +761,10 @@ def _parse_people_response(raw: str, content_type: str) -> list[dict[str, str]]:
     if not isinstance(people, list):
         raise LlmError("Codex вернул JSON без массива people")
     parsed: list[dict[str, str]] = []
-    allowed_roles = {"artist"} if content_type == "music" else {"actor", "director"}
+    allowed_roles = (
+        {"artist"} if content_type == "music"
+        else ({selected_role} if selected_role in {"actor", "director"} else {"actor", "director"})
+    )
     for index, person in enumerate(people, start=1):
         if not isinstance(person, dict):
             raise LlmError(f"Позиция {index} в ответе Codex имеет неверный формат")
@@ -766,13 +816,20 @@ def recommend_people(payload: dict[str, Any]) -> dict[str, Any]:
             message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
             raise LlmError(f"Codex SDK: {message[-1200:]}")
         recommendation_progress.finish_stage(progress_id, "llm-request")
-        candidates = _parse_people_response(completed.stdout.strip(), content_type)[:requested]
+        selected_role = str(payload.get("role") or "").strip() if content_type == "movie" else ""
+        candidates = _parse_people_response(
+            completed.stdout.strip(), content_type, selected_role,
+        )[:requested]
         provider = "MusicBrainz" if content_type == "music" else "TMDB"
         stage_id = "musicbrainz-people" if content_type == "music" else "tmdb-people"
         recommendation_progress.set_stage(
-            progress_id, stage_id, f"{provider} · карточки персон", len(candidates), "персон",
+            progress_id, stage_id,
+            f"{provider} · карточки {'исполнителей' if content_type == 'music' else 'персон'}",
+            len(candidates), "исполнителей" if content_type == "music" else "персон",
         )
-        existing = storage.list_interests(content_type, include_trashed=True)
+        existing = storage.list_interests(
+            content_type, selected_role or None, include_trashed=True,
+        )
         known_names = set().union(*(_person_name_keys(person) for person in existing)) if existing else set()
         id_field = "mbid" if content_type == "music" else "tmdb_id"
         known_ids = {
@@ -821,6 +878,30 @@ def recommend_people(payload: dict[str, Any]) -> dict[str, Any]:
             finally:
                 recommendation_progress.advance(progress_id, stage_id)
         recommendation_progress.finish_stage(progress_id, stage_id)
+        if content_type == "music":
+            artwork_stage_id = "fanart-people"
+            recommendation_progress.set_stage(
+                progress_id, artwork_stage_id,
+                "fanart.tv · фотографии исполнителей", len(items), "исполнителей",
+            )
+            for index, details in enumerate(items):
+                if recommendation_progress.is_cancelled(progress_id):
+                    break
+                try:
+                    enriched = musicbrainz.enrich_artist_artwork(details)
+                    items[index] = enriched
+                    for warning in enriched.get("provider_warnings", []):
+                        if isinstance(warning, dict):
+                            recommendation_progress.add_warning(
+                                progress_id,
+                                str(warning.get("provider") or "fanart.tv"),
+                                str(warning.get("message") or ""),
+                            )
+                except Exception as error:
+                    recommendation_progress.add_warning(progress_id, "fanart.tv", str(error))
+                finally:
+                    recommendation_progress.advance(progress_id, artwork_stage_id)
+            recommendation_progress.finish_stage(progress_id, artwork_stage_id)
         return {
             "items": items, "errors": errors, "model": model,
             "requested": requested, "received": len(candidates),

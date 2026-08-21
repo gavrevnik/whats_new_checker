@@ -119,7 +119,10 @@ CREATE TABLE IF NOT EXISTS music_artists (
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     raw_json TEXT NOT NULL DEFAULT '{}',
     details_json TEXT NOT NULL DEFAULT '{}',
-    musicbrainz_updated_at TEXT
+    musicbrainz_updated_at TEXT,
+    profile_url TEXT NOT NULL DEFAULT '',
+    profile_local_path TEXT NOT NULL DEFAULT '',
+    fanart_updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS album_artists (
@@ -318,6 +321,11 @@ def initialize_database(path: Path | None = None) -> None:
                 "total_listen_count": "INTEGER",
                 "listenbrainz_updated_at": "TEXT",
             },
+            "music_artists": {
+                "profile_url": "TEXT NOT NULL DEFAULT ''",
+                "profile_local_path": "TEXT NOT NULL DEFAULT ''",
+                "fanart_updated_at": "TEXT",
+            },
         }
         for table, columns in migrations.items():
             existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
@@ -398,6 +406,9 @@ def initialize_database(path: Path | None = None) -> None:
         )
         connection.execute(
             "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (10, ?)", (_now(),)
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (11, ?)", (_now(),)
         )
         connection.execute(
             "INSERT OR IGNORE INTO content_types(code, name_ru, enabled) VALUES ('movie', 'Фильмы', 1)"
@@ -722,7 +733,10 @@ def list_music_artists(include_trashed: bool = False) -> list[dict[str, Any]]:
                ma.country, ma.area, ma.disambiguation, ma.life_span_begin,
                ma.life_span_end, ma.active, COALESCE(ma.raw_json, '{{}}') AS raw_json,
                COALESCE(ma.details_json, '{{}}') AS details_json,
-               COALESCE(ma.musicbrainz_updated_at, '') AS musicbrainz_updated_at
+               COALESCE(ma.musicbrainz_updated_at, '') AS musicbrainz_updated_at,
+               COALESCE(ma.profile_url, '') AS profile_url,
+               COALESCE(ma.profile_local_path, '') AS profile_local_path,
+               COALESCE(ma.fanart_updated_at, '') AS fanart_updated_at
         FROM music_artists ma
         WHERE {' AND '.join(clauses)}
         ORDER BY ma.sort_name, ma.name
@@ -739,6 +753,16 @@ def get_interest_person(person_id: str) -> dict[str, Any]:
     if not person:
         raise StorageError("Person not found")
     return person
+
+
+def get_music_artist(artist_id: str) -> dict[str, Any]:
+    artist = next(
+        (row for row in list_music_artists(include_trashed=True) if str(row["id"]) == str(artist_id)),
+        None,
+    )
+    if not artist:
+        raise StorageError("Artist not found")
+    return artist
 
 
 def list_trash() -> list[dict[str, Any]]:
@@ -861,7 +885,10 @@ def empty_trash() -> dict[str, Any]:
             "JOIN albums a ON a.content_id = t.entity_id WHERE t.entity_type = 'album' "
             "UNION "
             "SELECT p.profile_local_path AS path FROM trash_entries t "
-            "JOIN people p ON p.id = t.entity_id WHERE t.entity_type = 'person'"
+            "JOIN people p ON p.id = t.entity_id WHERE t.entity_type = 'person' "
+            "UNION "
+            "SELECT ma.profile_local_path AS path FROM trash_entries t "
+            "JOIN music_artists ma ON ma.id = t.entity_id WHERE t.entity_type = 'music_artist'"
         ).fetchall()
         artwork_paths = {str(row["path"] or "").strip() for row in artwork_rows} - {""}
 
@@ -908,7 +935,8 @@ def empty_trash() -> dict[str, Any]:
         referenced_rows = connection.execute(
             "SELECT poster_local_path AS path FROM movies WHERE poster_local_path <> '' "
             "UNION SELECT cover_path AS path FROM albums WHERE cover_path <> '' "
-            "UNION SELECT profile_local_path AS path FROM people WHERE profile_local_path <> ''"
+            "UNION SELECT profile_local_path AS path FROM people WHERE profile_local_path <> '' "
+            "UNION SELECT profile_local_path AS path FROM music_artists WHERE profile_local_path <> ''"
         ).fetchall()
         referenced_paths = {str(row["path"] or "").strip() for row in referenced_rows}
 
@@ -1011,6 +1039,9 @@ def add_music_artist(artist: dict[str, Any]) -> dict[str, Any]:
         },
         "{}",
     )
+    profile_url = str(artist.get("profile_url") or "")
+    profile_local_path = str(artist.get("profile_local_path") or "")
+    fanart_checked = bool(artist.get("fanart_checked"))
     initialize_database()
     with _lock, connect() as connection:
         existing = None
@@ -1028,19 +1059,24 @@ def add_music_artist(artist: dict[str, Any]) -> dict[str, Any]:
                 "UPDATE music_artists SET active = 1, name = ?, sort_name = COALESCE(NULLIF(?, ''), sort_name), "
                 "mbid = COALESCE(?, mbid), artist_type = COALESCE(NULLIF(?, ''), artist_type), "
                 "country = COALESCE(NULLIF(?, ''), country), area = COALESCE(NULLIF(?, ''), area), "
-                "disambiguation = COALESCE(NULLIF(?, ''), disambiguation), raw_json = ? WHERE id = ?",
+                "disambiguation = COALESCE(NULLIF(?, ''), disambiguation), raw_json = ?, "
+                "profile_url = COALESCE(NULLIF(?, ''), profile_url), "
+                "profile_local_path = COALESCE(NULLIF(?, ''), profile_local_path), "
+                "fanart_updated_at = CASE WHEN ? THEN ? ELSE fanart_updated_at END WHERE id = ?",
                 (
                     name, str(artist.get("sort_name") or ""), mbid,
                     str(artist.get("artist_type") or artist.get("type") or ""),
                     str(artist.get("country") or ""), str(artist.get("area") or ""),
-                    str(artist.get("disambiguation") or ""), raw_json, artist_id,
+                    str(artist.get("disambiguation") or ""), raw_json, profile_url,
+                    profile_local_path, int(fanart_checked), _now(), artist_id,
                 ),
             )
         else:
             connection.execute(
                 "INSERT INTO music_artists(id, name, sort_name, mbid, artist_type, country, area, "
-                "disambiguation, life_span_begin, life_span_end, active, raw_json, details_json, musicbrainz_updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                "disambiguation, life_span_begin, life_span_end, active, raw_json, details_json, musicbrainz_updated_at, "
+                "profile_url, profile_local_path, fanart_updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
                 (
                     artist_id, name, str(artist.get("sort_name") or name), mbid,
                     str(artist.get("artist_type") or artist.get("type") or ""),
@@ -1049,6 +1085,7 @@ def add_music_artist(artist: dict[str, Any]) -> dict[str, Any]:
                     str(artist.get("life_span_end") or ""), raw_json,
                     _json(artist.get("details_json") or {}, "{}"),
                     artist.get("musicbrainz_updated_at") or None,
+                    profile_url, profile_local_path, _now() if fanart_checked else None,
                 ),
             )
     return next(row for row in list_music_artists() if row["id"] == artist_id)
@@ -1057,6 +1094,7 @@ def add_music_artist(artist: dict[str, Any]) -> dict[str, Any]:
 def update_music_artist(artist_id: str, details: dict[str, Any]) -> dict[str, Any]:
     initialize_database()
     mbid = str(details.get("mbid") or details.get("external_id") or "").strip() or None
+    fanart_checked = bool(details.get("fanart_checked"))
     with _lock, connect() as connection:
         if not connection.execute(
             "SELECT 1 FROM music_artists WHERE id = ?", (artist_id,)
@@ -1075,7 +1113,9 @@ def update_music_artist(artist_id: str, details: dict[str, Any]) -> dict[str, An
             "area = COALESCE(NULLIF(?, ''), area), disambiguation = COALESCE(NULLIF(?, ''), disambiguation), "
             "life_span_begin = COALESCE(NULLIF(?, ''), life_span_begin), "
             "life_span_end = COALESCE(NULLIF(?, ''), life_span_end), details_json = ?, "
-            "musicbrainz_updated_at = ? WHERE id = ?",
+            "musicbrainz_updated_at = ?, profile_url = COALESCE(NULLIF(?, ''), profile_url), "
+            "profile_local_path = COALESCE(NULLIF(?, ''), profile_local_path), "
+            "fanart_updated_at = CASE WHEN ? THEN ? ELSE fanart_updated_at END WHERE id = ?",
             (
                 str(details.get("name") or details.get("name_original") or ""),
                 str(details.get("sort_name") or details.get("sort-name") or ""), mbid,
@@ -1084,7 +1124,9 @@ def update_music_artist(artist_id: str, details: dict[str, Any]) -> dict[str, An
                 str(details.get("disambiguation") or ""),
                 str(details.get("life_span_begin") or life_span.get("begin") or ""),
                 str(details.get("life_span_end") or life_span.get("end") or ""),
-                _json(details.get("details_json") or details, "{}"), _now(), artist_id,
+                _json(details.get("details_json") or details, "{}"), _now(),
+                str(details.get("profile_url") or ""), str(details.get("profile_local_path") or ""),
+                int(fanart_checked), _now(), artist_id,
             ),
         )
     return next(row for row in list_music_artists() if row["id"] == artist_id)
@@ -1718,7 +1760,8 @@ def movie_refresh_targets() -> list[dict[str, Any]]:
         {key: row[key] for key in (
             "id", "title_original", "title_ru", "year", "tmdb_id", "imdb_id",
             "imdb_rating", "kinopoisk_rating", "directors", "poster_path", "poster_url",
-            "poster_local_path",
+            "poster_local_path", "release_date", "duration_minutes", "genres", "overview",
+            "cast", "tmdb_updated_at",
         )}
         for row in list_library(content_type="movie")
     ]
@@ -1743,6 +1786,8 @@ def album_refresh_targets() -> list[dict[str, Any]]:
         {key: row.get(key) for key in (
             "id", "title_original", "title_ru", "year", "release_group_mbid", "artists",
             "cover_url", "cover_path", "total_listen_count", "listenbrainz_updated_at",
+            "first_release_date", "track_count", "primary_type", "musicbrainz_updated_at",
+            "cover_art_updated_at",
         )}
         for row in list_library(content_type="music")
     ]
@@ -1783,6 +1828,21 @@ def update_person_artwork_path(
     return get_interest_person(person_id)
 
 
+def update_music_artist_artwork_path(
+    artist_id: str, relative_path: str, profile_url: str = "",
+) -> dict[str, Any]:
+    initialize_database()
+    with _lock, connect() as connection:
+        cursor = connection.execute(
+            "UPDATE music_artists SET profile_local_path = ?, "
+            "profile_url = COALESCE(NULLIF(?, ''), profile_url), fanart_updated_at = ? WHERE id = ?",
+            (str(relative_path or ""), str(profile_url or ""), _now(), artist_id),
+        )
+        if not cursor.rowcount:
+            raise StorageError("Artist not found")
+    return get_music_artist(artist_id)
+
+
 def update_album_popularity(counts: dict[str, int | None]) -> int:
     initialize_database()
     refreshed_at = _now()
@@ -1799,10 +1859,16 @@ def update_album_popularity(counts: dict[str, int | None]) -> int:
 
 
 def artist_refresh_targets() -> list[dict[str, Any]]:
+    from app import artwork
+
     return [
-        {key: row.get(key) for key in ("id", "name_original", "name_ru", "mbid")}
+        {key: row.get(key) for key in (
+            "id", "name_original", "name_ru", "mbid", "profile_url", "profile_local_path",
+        )}
         for row in list_music_artists()
         if not str(row.get("mbid") or row.get("external_id") or "").strip()
+        or not str(row.get("musicbrainz_updated_at") or "").strip()
+        or not artwork.is_cached(row.get("profile_local_path"))
     ]
 
 

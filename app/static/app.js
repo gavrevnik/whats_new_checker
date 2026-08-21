@@ -1,4 +1,4 @@
-const state = { items: [], interests: [], trash: [], view: "backlog", contentType: "movie", backlogRecommendMode: "llm", query: "", apiItems: [], apiFilteredItems: [], llmItems: [], llmFilteredItems: [], llmErrors: [], llmRawResponse: "", recommendationCancelled: false, peopleRecommendationItems: [], peopleRecommendationErrors: [], peopleRecommendationCancelled: false, apiProgressWarnings: [], recommendationSort: {key:"year",direction:"desc"}, tmdb: {}, musicbrainz: {}, llm: {}, llmContextSeed: "", sortKey: "release_date", sortDirection: "desc", peopleSort: {director:{key:"name_ru",direction:"asc"},actor:{key:"name_ru",direction:"asc"},artist:{key:"name_original",direction:"asc"}}, currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingAlbumDetails: null, pendingPersonDetails: null, pendingArtistDetails: null, pendingMovieRaw: null, pendingAlbumRaw: null, pendingPersonRaw: null, pendingArtistRaw: null, pendingMovieSearchField: "", pendingAlbumSearchField: "" };
+const state = { items: [], interests: [], trash: [], view: "backlog", contentType: "movie", backlogRecommendMode: "llm", query: "", apiItems: [], apiFilteredItems: [], apiPeriod: "", llmItems: [], llmFilteredItems: [], llmErrors: [], llmRawResponse: "", recommendationCancelled: false, peopleRecommendationItems: [], peopleRecommendationErrors: [], peopleRecommendationCancelled: false, apiProgressWarnings: [], recommendationSort: {key:"year",direction:"desc"}, tmdb: {}, musicbrainz: {}, llm: {}, llmContextSeed: "", sortKey: "release_date", sortDirection: "desc", peopleSort: {director:{key:"name_ru",direction:"asc"},actor:{key:"name_ru",direction:"asc"},artist:{key:"name_original",direction:"asc"}}, currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingAlbumDetails: null, pendingPersonDetails: null, pendingArtistDetails: null, pendingMovieRaw: null, pendingAlbumRaw: null, pendingPersonRaw: null, pendingArtistRaw: null, pendingMovieSearchField: "", pendingAlbumSearchField: "" };
 const activeOperations = {recommendation:"",people:"",refresh:""};
 const operationRunning = () => Object.values(activeOperations).some(Boolean);
 const $ = selector => document.querySelector(selector);
@@ -25,6 +25,12 @@ function awardsSummary(raw) {
 }
 
 function text(value) { return value === null || value === undefined || value === "" ? "—" : String(value); }
+function addedDate(value) {
+  const date = new Date(String(value || ""));
+  return Number.isNaN(date.getTime()) ? text(value) : new Intl.DateTimeFormat("ru-RU", {
+    day:"2-digit",month:"2-digit",year:"numeric",
+  }).format(date);
+}
 function actionIcon(name) {
   const thumb = `<path d="M7 10v11H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3Z"/><path d="m7 10 4-7a2 2 0 0 1 3.7 1.5L14 8h5a2 2 0 0 1 2 2.4l-1.6 8a2 2 0 0 1-2 1.6H7"/>`;
   const paths = {
@@ -42,7 +48,7 @@ function plannedSoonButton(item) {
   return `<button type="button" class="icon-button outline-action-button planned-soon-button${active ? " active" : ""}" data-planned-soon-toggle data-id="${escapeHtml(item.id)}" title="${label}" aria-label="${label}" aria-pressed="${active}">${actionIcon("calendarCheck")}</button>`;
 }
 function providerWarningText(warning) {
-  const labels = {"cover-art-archive":"Cover Art Archive",listenbrainz:"ListenBrainz",musicbrainz:"MusicBrainz",kinopoisk:"Кинопоиск","tmdb-images":"TMDB Images",tmdb:"TMDB"};
+  const labels = {"cover-art-archive":"Cover Art Archive",listenbrainz:"ListenBrainz",musicbrainz:"MusicBrainz",kinopoisk:"Кинопоиск","tmdb-images":"TMDB Images","fanart.tv":"fanart.tv",tmdb:"TMDB"};
   const label = labels[String(warning?.provider || "").toLowerCase()] || warning?.provider || "API", message = String(warning?.message || "");
   if (!message) return "";
   return message.toLowerCase().includes(String(label).toLowerCase()) ? message : `${label}: ${message}`;
@@ -138,11 +144,46 @@ function moviePosterHtml(item, className = "movie-poster") {
   const url = available && (artworkItemUrl(item,"movie") || localArtworkUrl(item?.poster_local_path) || validUrl(item?.poster_url));
   return url ? `<img class="${className}" src="${escapeHtml(url)}" alt="Постер ${escapeHtml(title(item))}" loading="lazy" data-artwork>` : `<span class="movie-poster-placeholder" aria-hidden="true"></span>`;
 }
-function personPhotoHtml(item, className = "person-photo") {
+function personPhotoUrl(item) {
   const available = item?.profile_local_path || item?.profile_path || validUrl(item?.profile_url);
   const storedUrl = item?.id && available ? `/api/artwork/person/${encodeURIComponent(item.id)}` : "";
-  const url = available && (storedUrl || localArtworkUrl(item?.profile_local_path) || validUrl(item?.profile_url));
+  return available && (storedUrl || localArtworkUrl(item?.profile_local_path) || validUrl(item?.profile_url));
+}
+function personPhotoHtml(item, className = "person-photo") {
+  const url = personPhotoUrl(item);
   return url ? `<img class="${className}" src="${escapeHtml(url)}" alt="Фото ${escapeHtml(titlePerson(item))}" loading="lazy" data-artwork>` : `<span class="person-photo-placeholder ${className === "detail-person-photo" ? "detail-person-photo" : ""}" aria-hidden="true"></span>`;
+}
+function personImdbId(item) {
+  if (item?.imdb_id) return String(item.imdb_id);
+  try {
+    const metadata = typeof item?.details_json === "string" ? JSON.parse(item.details_json || "{}") : (item?.details_json || {});
+    return String(metadata.imdb_id || metadata.external_ids?.imdb_id || "");
+  } catch { return ""; }
+}
+function personExternalLinkHtml(item) {
+  const music = item?.content_type === "music" || item?.role === "artist";
+  const mbid = String(item?.mbid || (music ? item?.external_id : "") || "");
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(mbid)) {
+    return `<a class="external-link person-provider-link" data-person-external-link href="https://musicbrainz.org/artist/${encodeURIComponent(mbid)}" target="_blank" rel="noreferrer">MusicBrainz ↗</a>`;
+  }
+  const imdbId = personImdbId(item), validImdbId = /^nm\d+$/.test(imdbId) ? imdbId : "";
+  return validImdbId ? `<a class="external-link person-provider-link" data-person-external-link href="https://www.imdb.com/name/${encodeURIComponent(validImdbId)}/" target="_blank" rel="noreferrer">IMDb ↗</a>` : "";
+}
+function personPortraitHtml(item, className = "person-photo", recommendationIndex = null) {
+  const photo = personPhotoHtml(item,className);
+  const viewablePhoto = recommendationIndex !== null && personPhotoUrl(item)
+    ? `<button type="button" class="person-photo-view-button" data-view-person-photo="${recommendationIndex}" aria-label="Открыть фотографию ${escapeHtml(titlePerson(item))} крупнее" title="Открыть фотографию крупнее">${photo}</button>`
+    : photo;
+  return `<div class="person-portrait">${viewablePhoto}${personExternalLinkHtml(item)}</div>`;
+}
+function openPersonPhotoViewer(index) {
+  const item = state.peopleRecommendationItems[index], url = personPhotoUrl(item);
+  if (!item || !url) return;
+  const image = $("#person-photo-view-image");
+  $("#person-photo-view-title").textContent = titlePerson(item);
+  image.src = url;
+  image.alt = `Фото ${titlePerson(item)}`;
+  $("#person-photo-view-dialog").showModal();
 }
 function albumTypes(item) {
   let secondary = item.secondary_types || item.secondary_types_json || [];
@@ -236,7 +277,7 @@ function movieRow(item) {
     <td class="movie-poster-cell">${moviePosterHtml(item)}</td><td class="movie-title backlog-title-cell">${titleCell}</td>
     <td class="backlog-release-cell">${escapeHtml(text(item.release_date || item.year))}</td><td class="backlog-director-cell">${directorsCellHtml(item.directors)}</td>
     <td>${escapeHtml(movieRatings(item))}</td><td class="cell-people">${escapeHtml(text(formatKeyPeople(item, true, true, true)))}</td>
-    <td class="countries-cell">${escapeHtml(text(item.countries))}</td><td class="planned-soon-cell">${plannedSoonButton(item)}</td>
+    <td class="countries-cell">${escapeHtml(text(item.countries))}</td><td class="added-at-cell">${escapeHtml(addedDate(item.added_at))}</td><td class="planned-soon-cell">${plannedSoonButton(item)}</td>
     <td><div class="table-actions">${action}</div></td>
   </tr>`;
 }
@@ -244,15 +285,15 @@ function movieRow(item) {
 function albumRow(item) {
   const action = `<button type="button" class="mini-button like reaction-button outline-action-button" data-item-action="like" data-id="${escapeHtml(item.id)}" title="Понравилось" aria-label="Понравилось">${actionIcon("like")}</button><button type="button" class="mini-button dislike reaction-button outline-action-button" data-item-action="dislike" data-id="${escapeHtml(item.id)}" title="Не понравилось" aria-label="Не понравилось">${actionIcon("dislike")}</button><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="album" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить альбом в корзину">${actionIcon("trash")}</button>`;
   const titleCell = `<button class="movie-title-button" data-details-id="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title_original || title(item))}</strong><span>${escapeHtml(text(item.artists))}</span></button>`;
-  return `<tr><td class="album-cover-cell">${albumCoverHtml(item)}</td><td class="movie-title">${titleCell}</td><td>${escapeHtml(text(item.artists))}</td><td>${escapeHtml(text(item.first_release_date || item.year))}</td><td>${escapeHtml(text(item.track_count))}</td><td>${escapeHtml(listenCount(item))}</td><td class="cell-links"><a class="external-link" href="${escapeHtml(youtubeMusicAlbumUrl(item))}" target="_blank" rel="noreferrer">YouTube Music ↗</a></td><td class="planned-soon-cell">${plannedSoonButton(item)}</td><td><div class="table-actions">${action}</div></td></tr>`;
+  return `<tr><td class="album-cover-cell">${albumCoverHtml(item)}</td><td class="movie-title">${titleCell}</td><td>${escapeHtml(text(item.artists))}</td><td>${escapeHtml(text(item.first_release_date || item.year))}</td><td>${escapeHtml(text(item.track_count))}</td><td>${escapeHtml(listenCount(item))}</td><td class="cell-links"><a class="external-link" href="${escapeHtml(youtubeMusicAlbumUrl(item))}" target="_blank" rel="noreferrer">YouTube Music ↗</a></td><td class="added-at-cell">${escapeHtml(addedDate(item.added_at))}</td><td class="planned-soon-cell">${plannedSoonButton(item)}</td><td><div class="table-actions">${action}</div></td></tr>`;
 }
 
 function recommendationMovieRow(item, index, filtered = false) {
   const notes = state.backlogRecommendMode === "llm" ? `<td class="cell-notes">${escapeHtml(text(item.notes))}</td>` : "";
   const detailsAttribute = filtered ? `data-filtered-rec-details="${index}"` : `data-modal-rec-details="${index}"`;
   const actions = filtered
-    ? `<button type="button" class="mini-button done" data-filtered-rec-action="backlog" data-index="${index}">В бэклог</button>`
-    : `<button type="button" class="mini-button done" data-modal-rec-action="backlog" data-index="${index}">В бэклог</button><button type="button" class="mini-button like reaction-button" data-modal-rec-action="like" data-index="${index}" title="Понравилось" aria-label="Понравилось">+</button><button type="button" class="mini-button dislike reaction-button" data-modal-rec-action="dislike" data-index="${index}" title="Не понравилось" aria-label="Не понравилось">−</button><button type="button" class="mini-button remove" data-modal-rec-action="remove" data-index="${index}">Убрать</button>`;
+    ? `<button type="button" class="mini-button done card-action-button" data-filtered-rec-action="backlog" data-index="${index}">В бэклог</button>`
+    : `<button type="button" class="mini-button done card-action-button" data-modal-rec-action="backlog" data-index="${index}">В бэклог</button><button type="button" class="mini-button like reaction-button outline-action-button" data-modal-rec-action="like" data-index="${index}" title="Понравилось" aria-label="Понравилось">${actionIcon("like")}</button><button type="button" class="mini-button dislike reaction-button outline-action-button" data-modal-rec-action="dislike" data-index="${index}" title="Не понравилось" aria-label="Не понравилось">${actionIcon("dislike")}</button><button type="button" class="mini-button remove card-action-button" data-modal-rec-action="remove" data-index="${index}">Убрать</button>`;
   return `<tr>
     <td class="movie-poster-cell">${moviePosterHtml(item)}</td><td class="movie-title"><button type="button" class="movie-title-button" ${detailsAttribute}><strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span></button></td>
     <td>${escapeHtml(text(item.release_date || item.year))}</td><td>${escapeHtml(text(item.directors))}</td>
@@ -268,8 +309,8 @@ function recommendationAlbumRow(item, index, filtered = false) {
   const notes = state.backlogRecommendMode === "llm" ? `<td class="cell-notes">${escapeHtml(text(item.notes))}</td>` : "";
   const detailsAttribute = filtered ? `data-filtered-rec-details="${index}"` : `data-modal-rec-details="${index}"`;
   const actions = filtered
-    ? `<button type="button" class="mini-button done" data-filtered-rec-action="backlog" data-index="${index}">В бэклог</button>`
-    : `<button type="button" class="mini-button done" data-modal-rec-action="backlog" data-index="${index}">В бэклог</button><button type="button" class="mini-button like reaction-button" data-modal-rec-action="like" data-index="${index}" title="Понравилось" aria-label="Понравилось">+</button><button type="button" class="mini-button dislike reaction-button" data-modal-rec-action="dislike" data-index="${index}" title="Не понравилось" aria-label="Не понравилось">−</button><button type="button" class="mini-button remove" data-modal-rec-action="remove" data-index="${index}">Убрать</button>`;
+    ? `<button type="button" class="mini-button done card-action-button" data-filtered-rec-action="backlog" data-index="${index}">В бэклог</button>`
+    : `<button type="button" class="mini-button done card-action-button" data-modal-rec-action="backlog" data-index="${index}">В бэклог</button><button type="button" class="mini-button like reaction-button outline-action-button" data-modal-rec-action="like" data-index="${index}" title="Понравилось" aria-label="Понравилось">${actionIcon("like")}</button><button type="button" class="mini-button dislike reaction-button outline-action-button" data-modal-rec-action="dislike" data-index="${index}" title="Не понравилось" aria-label="Не понравилось">${actionIcon("dislike")}</button><button type="button" class="mini-button remove card-action-button" data-modal-rec-action="remove" data-index="${index}">Убрать</button>`;
   return `<tr><td class="album-cover-cell">${albumCoverHtml(item)}</td><td class="movie-title"><button type="button" class="movie-title-button" ${detailsAttribute}><strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span></button></td><td>${escapeHtml(text(item.artists))}</td><td>${escapeHtml(text(item.first_release_date || item.year))}</td><td>${escapeHtml(text(item.track_count))}</td><td>${escapeHtml(text(albumTypes(item)))}</td><td>${escapeHtml(text(item.genres))}</td><td>${escapeHtml(listenCount(item))}</td>${notes}<td class="cell-links">${albumLinksHtml(item)}</td><td><div class="table-actions">${actions}</div></td></tr>`;
 }
 
@@ -346,7 +387,8 @@ function renderApiRecommendations() {
   $("#backlog-recommend-body").innerHTML = state.apiItems.length
     ? sortedRecommendationEntries(state.apiItems).map(({item,index}) => (state.contentType === "music" ? recommendationAlbumRow : recommendationMovieRow)(item,index)).join("")
     : `<tr><td colspan="10" class="empty">Новых ${state.contentType === "music" ? "альбомов" : "фильмов"} по выбранным условиям нет</td></tr>`;
-  $("#backlog-recommend-message").textContent = `${state.recommendationCancelled ? "Остановлено. " : ""}Найдено новых ${state.contentType === "music" ? "альбомов" : "фильмов"}: ${state.apiItems.length}. Не прошли фильтрацию: ${state.apiFilteredItems.length}.`;
+  const period = state.apiPeriod ? `За период ${state.apiPeriod}` : "За весь доступный период";
+  $("#backlog-recommend-message").textContent = `${state.recommendationCancelled ? "Остановлено. " : ""}${period} найдено ${state.apiItems.length} ${state.contentType === "music" ? "альбомов" : "фильмов"}, не прошли фильтрацию ${state.apiFilteredItems.length}.`;
   $("#backlog-recommend-message").classList.remove("error");
   renderFilteredRecommendations();
   updateRecommendationSortIndicators();
@@ -366,7 +408,7 @@ function ratedCard(item) {
     <div class="rated-actions">
       <button type="button" class="mini-button like reaction-button outline-action-button${reaction === "like" ? " active" : ""}" data-reaction-toggle="like" data-id="${escapeHtml(item.id)}" title="${reaction === "like" ? "Убрать отметку «Понравилось»" : "Понравилось"}" aria-label="${reaction === "like" ? "Убрать отметку «Понравилось»" : "Понравилось"}" aria-pressed="${reaction === "like"}">${actionIcon("like")}</button>
       <button type="button" class="mini-button dislike reaction-button outline-action-button${reaction === "dislike" ? " active" : ""}" data-reaction-toggle="dislike" data-id="${escapeHtml(item.id)}" title="${reaction === "dislike" ? "Убрать отметку «Не понравилось»" : "Не понравилось"}" aria-label="${reaction === "dislike" ? "Убрать отметку «Не понравилось»" : "Не понравилось"}" aria-pressed="${reaction === "dislike"}">${actionIcon("dislike")}</button>
-      <button class="mini-button" data-item-action="backlog" data-id="${escapeHtml(item.id)}">В бэклог</button>
+      <button class="mini-button card-action-button" data-item-action="backlog" data-id="${escapeHtml(item.id)}">В бэклог</button>
       ${favoriteButton(item)}
     </div>
   </article>`;
@@ -384,10 +426,10 @@ function favoriteCard(item) {
 function renderLibrary() {
   const backlog = sortedBacklog(filtered(state.items.filter(item => item.status === "backlog")));
   if (state.contentType === "music") {
-    $("#backlog-head").innerHTML = `<tr><th>Обложка</th><th><button class="sort-button" data-sort="title_ru">Название</button></th><th><button class="sort-button" data-sort="artists">Исполнитель</button></th><th><button class="sort-button" data-sort="release_date">Первый выпуск</button></th><th><button class="sort-button" data-sort="track_count">Песен</button></th><th><button class="sort-button" data-sort="total_listen_count">Прослушивания</button></th><th>Link</th><th class="planned-soon-head"><button class="sort-button planned-soon-sort" data-sort="planned_soon" title="Сначала запланированные" aria-label="Сортировать: сначала запланированные">${actionIcon("calendarCheck")}</button></th><th></th></tr>`;
+    $("#backlog-head").innerHTML = `<tr><th>Обложка</th><th><button class="sort-button" data-sort="title_ru">Название</button></th><th><button class="sort-button" data-sort="artists">Исполнитель</button></th><th><button class="sort-button" data-sort="release_date">Первый выпуск</button></th><th><button class="sort-button" data-sort="track_count">Песен</button></th><th><button class="sort-button" data-sort="total_listen_count">Прослушивания</button></th><th>Link</th><th class="added-at-head"><button class="sort-button" data-sort="added_at">Добавлено</button></th><th class="planned-soon-head"><button class="sort-button planned-soon-sort" data-sort="planned_soon" title="Сначала запланированные" aria-label="Сортировать: сначала запланированные">${actionIcon("calendarCheck")}</button></th><th></th></tr>`;
     $("#backlog-body").innerHTML = backlog.map(albumRow).join("");
   } else {
-    $("#backlog-head").innerHTML = `<tr><th>Постер</th><th class="backlog-title-head"><button class="sort-button" data-sort="title_ru">Название</button></th><th class="backlog-release-head"><button class="sort-button" data-sort="release_date">Дата выхода</button></th><th class="backlog-director-head"><button class="sort-button" data-sort="directors">Режиссёр</button></th><th><button class="sort-button" data-sort="imdb_rating">IMDb / КП</button></th><th class="key-people-head"><button class="sort-button" data-sort="key_people">Ключевые персоны</button></th><th class="countries-head"><button class="sort-button" data-sort="countries">Страны</button></th><th class="planned-soon-head"><button class="sort-button planned-soon-sort" data-sort="planned_soon" title="Сначала запланированные" aria-label="Сортировать: сначала запланированные">${actionIcon("calendarCheck")}</button></th><th></th></tr>`;
+    $("#backlog-head").innerHTML = `<tr><th>Постер</th><th class="backlog-title-head"><button class="sort-button" data-sort="title_ru">Название</button></th><th class="backlog-release-head"><button class="sort-button" data-sort="release_date">Дата выхода</button></th><th class="backlog-director-head"><button class="sort-button" data-sort="directors">Режиссёр</button></th><th><button class="sort-button" data-sort="imdb_rating">IMDb / КП</button></th><th class="key-people-head"><button class="sort-button" data-sort="key_people">Ключевые персоны</button></th><th class="countries-head"><button class="sort-button" data-sort="countries">Страны</button></th><th class="added-at-head"><button class="sort-button" data-sort="added_at">Добавлено</button></th><th class="planned-soon-head"><button class="sort-button planned-soon-sort" data-sort="planned_soon" title="Сначала запланированные" aria-label="Сортировать: сначала запланированные">${actionIcon("calendarCheck")}</button></th><th></th></tr>`;
     $("#backlog-body").innerHTML = backlog.map(movieRow).join("");
   }
   $("#backlog-count").textContent = backlog.length; $("#backlog-empty").classList.toggle("hidden", backlog.length > 0); updateSortIndicators();
@@ -486,11 +528,6 @@ function editNote(field) {
   });
 }
 
-async function patchItem(id, changes) {
-  const {item} = await request(`/api/library/${encodeURIComponent(id)}`, {method:"PATCH", body:JSON.stringify(changes)});
-  state.items = state.items.map(existing => existing.id === item.id ? item : existing); renderLibrary(); toast(state.contentType === "music" ? "Музыкальная библиотека обновлена" : "Фильмотека обновлена");
-}
-
 const actionDelay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
 function actionFeedbackContainer(button) {
@@ -504,45 +541,55 @@ function clearActionFeedback(button, container) {
   container?.classList.remove("action-pending", "action-exiting");
 }
 
-async function patchItemWithFeedback(button, id, changes, {exit = false} = {}) {
-  if (button.dataset.actionBusy) return;
+async function cardActionWithFeedback(button, task, {exit = false} = {}) {
+  if (button.dataset.actionBusy) return null;
   const container = actionFeedbackContainer(button);
   button.dataset.actionBusy = "true";
   button.setAttribute("aria-disabled", "true");
   button.classList.add("is-confirming");
   container?.classList.add("action-pending");
-  const outcomePromise = request(`/api/library/${encodeURIComponent(id)}`, {
-    method:"PATCH", body:JSON.stringify(changes),
-  }).then(value => ({value}), error => ({error}));
+  const outcomePromise = Promise.resolve().then(task).then(value => ({value}), error => ({error}));
   await actionDelay(123);
   const outcome = await outcomePromise;
   if (outcome.error) {
     clearActionFeedback(button, container);
-    toast(outcome.error.message);
-    return;
+    throw outcome.error;
   }
+  button.classList.remove("is-confirming");
   if (exit && container) {
-    button.classList.remove("is-confirming");
     container.classList.add("action-exiting");
     await actionDelay(118);
   }
-  const updated = outcome.value.item;
-  state.items = state.items.map(existing => existing.id === updated.id ? updated : existing);
-  renderLibrary();
-  toast(state.contentType === "music" ? "Музыкальная библиотека обновлена" : "Фильмотека обновлена");
+  return {value:outcome.value,container};
+}
+
+async function patchItemWithFeedback(button, id, changes, {exit = false} = {}) {
+  try {
+    const outcome = await cardActionWithFeedback(button, () => request(
+      `/api/library/${encodeURIComponent(id)}`,
+      {method:"PATCH", body:JSON.stringify(changes)},
+    ), {exit});
+    if (!outcome) return;
+    const updated = outcome.value.item;
+    state.items = state.items.map(existing => existing.id === updated.id ? updated : existing);
+    renderLibrary();
+    toast(state.contentType === "music" ? "Музыкальная библиотека обновлена" : "Фильмотека обновлена");
+  } catch (error) { toast(error.message); }
 }
 
 async function toggleFavorite(button) {
   const item = state.items.find(movie => movie.id === button.dataset.id);
   if (!item) return;
-  button.disabled = true;
   try {
-    const result = await request(`/api/library/${encodeURIComponent(item.id)}/favorite`, {
-      method:"POST", body:JSON.stringify({favorite:!item.favorite}),
-    });
+    const outcome = await cardActionWithFeedback(button, () => request(
+      `/api/library/${encodeURIComponent(item.id)}/favorite`,
+      {method:"POST", body:JSON.stringify({favorite:!item.favorite})},
+    ), {exit:state.view === "favorites" && Boolean(item.favorite)});
+    if (!outcome) return;
+    const result = outcome.value;
     state.items = state.items.map(movie => movie.id === result.item.id ? result.item : movie);
     renderLibrary(); toast(result.item.favorite ? "Добавлено в избранное" : "Удалено из избранного");
-  } catch (error) { button.disabled = false; toast(error.message); }
+  } catch (error) { toast(error.message); }
 }
 
 function sortedPeople(items, role) {
@@ -569,14 +616,14 @@ function renderPeople() {
   if (state.contentType === "music") {
     const artists=sortedPeople(people,"artist");
     $("#movie-people-board").classList.add("hidden"); $("#music-people-board").classList.remove("hidden");
-    $("#artists-body").innerHTML = artists.length ? artists.map(item => `<tr class="person-row" data-person-details-id="${escapeHtml(item.id)}" tabindex="0"><td class="person-photo-cell">${personPhotoHtml(item)}</td><td><strong>${escapeHtml(text(item.name_original))}</strong></td><td>${escapeHtml(text(item.artist_type))}</td><td>${escapeHtml(text(item.country || item.area))}</td><td><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="music_artist" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить исполнителя в корзину">${actionIcon("trash")}</button></td></tr>`).join("") : `<tr><td colspan="5" class="empty">Ничего не найдено</td></tr>`;
+    $("#artists-body").innerHTML = artists.length ? artists.map(item => `<tr class="person-row" data-person-details-id="${escapeHtml(item.id)}" tabindex="0"><td class="person-photo-cell">${personPortraitHtml(item)}</td><td><strong>${escapeHtml(text(item.name_original))}</strong></td><td>${escapeHtml(text(item.artist_type))}</td><td>${escapeHtml(text(item.country || item.area))}</td><td><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="music_artist" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить исполнителя в корзину">${actionIcon("trash")}</button></td></tr>`).join("") : `<tr><td colspan="5" class="empty">Ничего не найдено</td></tr>`;
     $("#artists-count").textContent = artists.length; $("#people-count").textContent = artists.length; updatePeopleSortIndicators();
     return;
   }
   $("#movie-people-board").classList.remove("hidden"); $("#music-people-board").classList.add("hidden");
   for (const role of ["director", "actor"]) {
     const rows = sortedPeople(people.filter(item => item.role === role),role);
-    $(`#${role}s-body`).innerHTML = rows.length ? rows.map(item => `<tr class="person-row" data-person-details-id="${escapeHtml(item.id)}" tabindex="0" aria-label="Открыть карточку: ${escapeHtml(titlePerson(item))}"><td class="person-photo-cell">${personPhotoHtml(item)}</td><td><strong>${escapeHtml(text(item.name_ru))}</strong></td><td>${escapeHtml(text(item.name_original))}</td><td><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="person" data-id="${escapeHtml(item.id)}" data-role="${role}" title="В корзину" aria-label="Переместить персону в корзину">${actionIcon("trash")}</button></td></tr>`).join("") : `<tr><td colspan="4" class="empty">Ничего не найдено</td></tr>`;
+    $(`#${role}s-body`).innerHTML = rows.length ? rows.map(item => `<tr class="person-row" data-person-details-id="${escapeHtml(item.id)}" tabindex="0" aria-label="Открыть карточку: ${escapeHtml(titlePerson(item))}"><td class="person-photo-cell">${personPortraitHtml(item)}</td><td><strong>${escapeHtml(text(item.name_ru))}</strong></td><td>${escapeHtml(text(item.name_original))}</td><td><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="person" data-id="${escapeHtml(item.id)}" data-role="${role}" title="В корзину" aria-label="Переместить персону в корзину">${actionIcon("trash")}</button></td></tr>`).join("") : `<tr><td colspan="4" class="empty">Ничего не найдено</td></tr>`;
     $(`#${role}s-count`).textContent = rows.length;
   }
   $("#people-count").textContent = people.length; updatePeopleSortIndicators();
@@ -590,7 +637,7 @@ function showPersonDetails(person) {
     $("#person-details-role").textContent = "Карточка исполнителя";
     $("#refresh-person-detail").textContent = "↻ Актуализировать из MusicBrainz";
     const fields = [["Исполнитель",person.name_original],["Тип",person.artist_type],["Страна",person.country],["Регион",person.area],["Период",[person.life_span_begin,person.life_span_end].filter(Boolean).join(" — ")],["Уточнение",person.disambiguation],["MusicBrainz ID",person.mbid],["Raw · исходный ввод",formatRaw(person.raw_json)]];
-    $("#person-details-content").innerHTML = `<div class="detail wide"><span>Фото</span>${personPhotoHtml(person,"detail-person-photo")}</div>` + fields.map(([label,value]) => `<div class="detail"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
+    $("#person-details-content").innerHTML = `<div class="detail wide"><span>Фото</span>${personPortraitHtml(person,"detail-person-photo")}</div>` + fields.map(([label,value]) => `<div class="detail"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
     if (!$("#person-details-dialog").open) $("#person-details-dialog").showModal();
     return;
   }
@@ -602,7 +649,7 @@ function showPersonDetails(person) {
     ["TMDB ID", person.tmdb_id],
     ["Raw · исходный ввод", formatRaw(person.raw_json)],
   ];
-  $("#person-details-content").innerHTML = `<div class="detail wide"><span>Фото</span>${personPhotoHtml(person,"detail-person-photo")}</div>` + fields.map(([label, value]) => `<div class="detail"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
+  $("#person-details-content").innerHTML = `<div class="detail wide"><span>Фото</span>${personPortraitHtml(person,"detail-person-photo")}</div>` + fields.map(([label, value]) => `<div class="detail"><span>${label}</span><p>${escapeHtml(text(value))}</p></div>`).join("");
   if (!$("#person-details-dialog").open) $("#person-details-dialog").showModal();
 }
 
@@ -612,7 +659,7 @@ function renderTrash() {
   const music = state.contentType === "music";
   const movies = state.trash.filter(item => item.entity_type === (music ? "album" : "movie"));
   const people = state.trash.filter(item => item.entity_type === (music ? "music_artist" : "person"));
-  const restore = item => `<button class="mini-button" data-restore-id="${escapeHtml(item.id)}">Восстановить</button>`;
+  const restore = item => `<button class="mini-button card-action-button" data-restore-id="${escapeHtml(item.id)}">Восстановить</button>`;
   $("#trash-content-title").textContent = music ? "Альбомы" : "Фильмы";
   $("#trash-people-title").textContent = music ? "Исполнители" : "Персоны";
   $("#trash-content-head").innerHTML = music
@@ -724,43 +771,67 @@ function recommendationValues(form) {
   return values;
 }
 
+function apiRecommendationPeriod(values) {
+  const from = String(values.year_from || "").trim(), to = String(values.year_to || "").trim();
+  if (from && to) return `${from}–${to}`;
+  if (from) return `с ${from} года`;
+  if (to) return `до ${to} года`;
+  return "";
+}
+
+function setLlmContextLimits() {
+  const form = $(state.contentType === "music" ? "#album-recommend-form" : "#backlog-recommend-form");
+  const likedCount = state.items.filter(item => item.status === "consumed" && item.reaction === "like").length;
+  const likedInput = form.elements.namedItem("liked_sample_size");
+  const peopleInput = form.elements.namedItem("people_sample_size");
+  likedInput.value = String(likedCount);
+  peopleInput.value = String(state.interests.length);
+}
+
 async function addModalRecommendation(index, action, button) {
   const items = state.backlogRecommendMode === "llm" ? state.llmItems : state.apiItems;
   const source = items[index];
   if (!source) return;
   if (action === "remove") {
+    const outcome = await cardActionWithFeedback(button, () => true, {exit:true});
+    if (!outcome) return;
     items.splice(index, 1);
     if (state.backlogRecommendMode === "llm") renderLlmRecommendations(); else renderApiRecommendations();
     return;
   }
-  button.disabled = true;
   const payload = {...source};
   if (action === "backlog") { payload.status = "backlog"; payload.reaction = ""; }
   else { payload.status = "consumed"; payload.reaction = action; }
   try {
-    const {item} = await request("/api/library", {method:"POST", body:JSON.stringify(payload)});
+    const outcome = await cardActionWithFeedback(button, () => request(
+      "/api/library", {method:"POST", body:JSON.stringify(payload)},
+    ), {exit:true});
+    if (!outcome) return;
+    const {item} = outcome.value;
     state.items.push(item); items.splice(index, 1);
     if (state.backlogRecommendMode === "llm") renderLlmRecommendations(); else renderApiRecommendations();
     renderLibrary();
     toast(action === "backlog" ? "Добавлено в бэклог" : "Добавлено в просмотренное");
-  } catch (error) { button.disabled = false; toast(error.message); }
+  } catch (error) { toast(error.message); }
 }
 
 async function addFilteredRecommendation(index, button) {
   const records = currentFilteredRecommendations();
   const source = records[index]?.item;
   if (!source) return;
-  button.disabled = true;
   try {
-    const {item} = await request("/api/library", {
-      method:"POST", body:JSON.stringify({...source,status:"backlog",reaction:""}),
-    });
+    const outcome = await cardActionWithFeedback(button, () => request(
+      "/api/library",
+      {method:"POST", body:JSON.stringify({...source,status:"backlog",reaction:""})},
+    ), {exit:true});
+    if (!outcome) return;
+    const {item} = outcome.value;
     state.items.push(item);
     records.splice(index,1);
     if (state.backlogRecommendMode === "llm") renderLlmRecommendations(); else renderApiRecommendations();
     renderLibrary();
     toast("Добавлено в бэклог");
-  } catch (error) { button.disabled = false; toast(error.message); }
+  } catch (error) { toast(error.message); }
 }
 
 async function refreshTmdb() {
@@ -806,7 +877,7 @@ async function refreshCurrentMovie() {
     const music = state.contentType === "music";
     const {item} = await request(`/api/library/${encodeURIComponent(state.currentDetailId)}/${music ? "refresh-musicbrainz" : "refresh-tmdb"}`, {method:"POST",body:"{}"});
     state.items = state.items.map(existing => existing.id === item.id ? item : existing); renderLibrary(); showDetails(item);
-    const warnings = providerWarnings([item]); toast(warnings[0] || (item.refresh_skipped ? "Все необходимые данные уже заполнены" : `Карточка обновлена из ${music ? "MusicBrainz / ListenBrainz" : "TMDB"}`));
+    const warnings = providerWarnings([item]); toast(warnings[0] || (item.refresh_skipped ? "Все необходимые данные уже заполнены" : `Карточка обновлена из ${music ? "MusicBrainz / Cover Art Archive / ListenBrainz" : "TMDB / OMDb / Кинопоиск"}`));
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; button.textContent = state.contentType === "music" ? "↻ Актуализировать из MusicBrainz" : "↻ Актуализировать из TMDB"; }
 }
@@ -818,7 +889,9 @@ async function refreshCurrentPerson() {
     const music = state.contentType === "music";
     const {item} = await request(`/api/people/${encodeURIComponent(state.currentPersonId)}/${music ? "refresh-musicbrainz" : "refresh-tmdb"}`, {method:"POST",body:"{}"});
     state.interests = state.interests.map(existing => existing.id === item.id ? item : existing);
-    renderPeople(); renderInterestOptions(); showPersonDetails(item); toast(music ? "Исполнитель обновлён из MusicBrainz" : "Персона обновлена из TMDB");
+    renderPeople(); renderInterestOptions(); showPersonDetails(item);
+    const warnings = providerWarnings([item]);
+    toast(warnings[0] || (music ? "Исполнитель обновлён из MusicBrainz / fanart.tv" : "Персона обновлена из TMDB / TMDB Images"));
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; button.textContent = `↻ Актуализировать из ${state.contentType === "music" ? "MusicBrainz" : "TMDB"}`; }
 }
@@ -924,43 +997,38 @@ async function reloadActiveData() {
 }
 
 async function moveToTrash(button) {
-  if (button.dataset.actionBusy) return;
-  const container = actionFeedbackContainer(button);
-  button.dataset.actionBusy = "true";
-  button.setAttribute("aria-disabled", "true");
-  button.classList.add("is-confirming");
-  container?.classList.add("action-pending");
-  const outcomePromise = request("/api/trash", {
-    method:"POST",
-    body:JSON.stringify({entity_type:button.dataset.trashEntity, entity_id:button.dataset.id, role:button.dataset.role || ""}),
-  }).then(value => ({value}), error => ({error}));
-  await actionDelay(123);
-  const outcome = await outcomePromise;
-  if (outcome.error) {
-    clearActionFeedback(button, container);
-    toast(outcome.error.message);
-    return;
-  }
-  button.classList.remove("is-confirming");
-  if (container) {
-    container.classList.add("action-exiting");
-    await actionDelay(118);
-  }
+  let outcome = null;
   try {
+    outcome = await cardActionWithFeedback(button, () => request("/api/trash", {
+      method:"POST",
+      body:JSON.stringify({entity_type:button.dataset.trashEntity, entity_id:button.dataset.id, role:button.dataset.role || ""}),
+    }), {exit:true});
+    if (!outcome) return;
     await reloadActiveData();
     toast("Перемещено в корзину");
   } catch (error) {
-    container?.remove();
-    toast(`Перемещено в корзину, но список не обновлён: ${error.message}`);
+    if (outcome) {
+      outcome.container?.remove();
+      toast(`Перемещено в корзину, но список не обновлён: ${error.message}`);
+    } else toast(error.message);
   }
 }
 
 async function restoreFromTrash(button) {
-  button.disabled = true;
+  let outcome = null;
   try {
-    await request(`/api/trash/${encodeURIComponent(button.dataset.restoreId)}/restore`, {method:"POST", body:"{}"});
+    outcome = await cardActionWithFeedback(button, () => request(
+      `/api/trash/${encodeURIComponent(button.dataset.restoreId)}/restore`,
+      {method:"POST", body:"{}"},
+    ), {exit:true});
+    if (!outcome) return;
     await reloadActiveData(); toast("Восстановлено из корзины");
-  } catch (error) { button.disabled = false; toast(error.message); }
+  } catch (error) {
+    if (outcome) {
+      outcome.container?.remove();
+      toast(`Восстановлено, но список не обновлён: ${error.message}`);
+    } else toast(error.message);
+  }
 }
 
 async function clearTrash(button) {
@@ -1020,6 +1088,7 @@ function openBacklogRecommendation(mode = "llm") {
   $("#backlog-recommend-provider").textContent = `${provider}${model}${state.llm.configured === false ? " · требуется установка" : ""}`;
   $("#backlog-api-provider").textContent = state.tmdb.configured ? `TMDB · подключён${state.tmdb.omdb_configured ? " · OMDb" : ""}${state.tmdb.kinopoisk_configured ? " · КП" : ""}` : "TMDB · нужен ключ";
   setBacklogRecommendMode(mode);
+  if (mode === "llm") setLlmContextLimits();
   if (mode === "api" && state.contentType === "movie") {
     document.querySelectorAll('input[name="actor_ids"],input[name="director_ids"]').forEach(box => { box.checked = false; });
     updateSelectedLabels();
@@ -1119,7 +1188,7 @@ function renderPeopleRecommendations() {
     const localized = item.name_ru || item.name_original, original = item.name_original || "";
     const names = `<strong>${escapeHtml(text(localized))}</strong>${original && original !== localized ? `<br><span class="cell-muted">${escapeHtml(original)}</span>` : ""}`;
     const role = music ? (item.artist_type || "Исполнитель") : item.role === "director" ? "Режиссёр" : "Актёр";
-    return `<tr><td class="person-photo-cell">${personPhotoHtml(item)}</td><td>${names}</td><td>${escapeHtml(role)}</td><td>${escapeHtml(text(item.llm_comment || item.notes))}</td><td><div class="table-actions"><button class="mini-button done" data-add-recommended-person="${index}">Добавить</button><button class="mini-button remove" data-remove-recommended-person="${index}">Убрать</button></div></td></tr>`;
+    return `<tr><td class="person-photo-cell">${personPortraitHtml(item,"person-photo",index)}</td><td>${names}</td><td>${escapeHtml(role)}</td><td>${escapeHtml(text(item.llm_comment || item.notes))}</td><td><div class="table-actions"><button class="mini-button done card-action-button" data-add-recommended-person="${index}">Добавить</button><button class="mini-button remove card-action-button" data-remove-recommended-person="${index}">Убрать</button></div></td></tr>`;
   }).join("") : `<tr><td colspan="5" class="empty">Подходящих новых рекомендаций не найдено</td></tr>`;
   const errors = state.peopleRecommendationErrors;
   const prefix = state.peopleRecommendationCancelled ? "Остановлено. " : "";
@@ -1128,18 +1197,41 @@ function renderPeopleRecommendations() {
     : `${prefix}Показано рекомендаций: ${items.length}.`;
 }
 
+function setPeopleRecommendationRole(role) {
+  if (!["actor","director"].includes(role)) return;
+  const roleInput = $("#people-recommend-role"), contextLimit = $("#people-recommend-context-limit");
+  roleInput.value = role;
+  document.querySelectorAll("[data-people-recommend-role]").forEach(button => {
+    const active = button.dataset.peopleRecommendRole === role;
+    button.classList.toggle("active",active);
+    button.setAttribute("aria-checked",String(active));
+  });
+  const count = state.interests.filter(person => person.role === role).length;
+  contextLimit.max = String(count);
+  contextLimit.value = String(count);
+  const entity = role === "director" ? "режиссёров" : "актёров";
+  $("#people-recommend-title").textContent = role === "director" ? "Порекомендовать режиссёра" : "Порекомендовать актёра";
+  $("#people-recommend-form textarea").placeholder = role === "director"
+    ? "Например: порекомендуй современных европейских режиссёров с необычным визуальным стилем"
+    : "Например: порекомендуй характерных драматических актёров европейского кино";
+  $("#people-recommend-context-limit-label").textContent = `Макс. любимых ${entity} в контексте`;
+  $("#people-recommend-context").textContent = `В системный промпт попадут до ${count} любимых ${entity} как сигнал вкуса и полный список уже добавленных ${entity}, включая корзину, для исключения повторов. Результаты будут уточнены через TMDB.`;
+}
+
 function openPeopleRecommendation() {
   if(operationRunning()){toast("Дождитесь завершения текущей операции или остановите её");return;}
   const music = state.contentType === "music", provider = state.llm.provider || "Codex SDK";
   state.peopleRecommendationItems = []; state.peopleRecommendationErrors = []; state.peopleRecommendationCancelled = false;
   $("#people-recommend-form").reset();
-  $("#people-recommend-title").textContent = music ? "Порекомендовать исполнителя" : "Порекомендовать персону";
-  $("#people-recommend-form textarea").placeholder = music
-    ? "Например: порекомендуй современных трип-хоп исполнителей с мрачным атмосферным звучанием"
-    : "Например: порекомендуй современных европейских режиссёров с необычным визуальным стилем";
-  $("#people-recommend-context").textContent = music
-    ? "В системный промпт автоматически добавятся все уже добавленные исполнители, включая корзину. Результаты будут уточнены через MusicBrainz."
-    : "В системный промпт автоматически добавятся все уже добавленные актёры и режиссёры, включая корзину. Результаты будут уточнены через TMDB.";
+  const roleField = $("#people-recommend-role-field"), contextLimitField = $("#people-recommend-context-limit-field");
+  const roleInput = $("#people-recommend-role"), contextLimit = $("#people-recommend-context-limit");
+  roleField.classList.toggle("hidden",music); contextLimitField.classList.toggle("hidden",music);
+  roleInput.disabled = music; contextLimit.disabled = music;
+  if (music) {
+    $("#people-recommend-title").textContent = "Порекомендовать исполнителя";
+    $("#people-recommend-form textarea").placeholder = "Например: порекомендуй современных трип-хоп исполнителей с мрачным атмосферным звучанием";
+    $("#people-recommend-context").textContent = "В системный промпт автоматически добавятся все уже добавленные исполнители, включая корзину. Карточки будут уточнены через MusicBrainz, фотографии — через fanart.tv.";
+  } else setPeopleRecommendationRole("director");
   $("#people-recommend-provider").textContent = `${provider}${state.llm.model ? ` · ${state.llm.model}` : ""}${state.llm.configured === false ? " · требуется установка" : ""}`;
   $("#people-recommend-result").classList.add("hidden");
   $("#people-recommend-progress").classList.add("hidden");
@@ -1163,7 +1255,7 @@ async function runPeopleRecommendation(event) {
     const result = await request("/api/recommendations/people/llm",{method:"POST",body:JSON.stringify(payload)});
     state.peopleRecommendationItems = result.items || []; state.peopleRecommendationErrors = result.errors || []; state.peopleRecommendationCancelled = Boolean(result.cancelled);
     renderPeopleRecommendations();
-    $("#people-recommend-result-source").textContent = state.contentType === "music" ? "Codex + MusicBrainz" : "Codex + TMDB";
+    $("#people-recommend-result-source").textContent = state.contentType === "music" ? "Codex + MusicBrainz + fanart.tv" : "Codex + TMDB";
     $("#people-recommend-model").textContent = result.model || "Codex";
     $("#people-recommend-result").classList.remove("hidden");
   } catch (error) { errorNode.textContent = error.message; }
@@ -1173,19 +1265,31 @@ async function runPeopleRecommendation(event) {
 async function addRecommendedPerson(index, button) {
   const source = state.peopleRecommendationItems[index];
   if (!source) return;
-  button.disabled = true;
   try {
-    const {item} = await request("/api/people",{method:"POST",body:JSON.stringify(source)});
+    const outcome = await cardActionWithFeedback(button, () => request(
+      "/api/people", {method:"POST",body:JSON.stringify(source)},
+    ), {exit:true});
+    if (!outcome) return;
+    const {item} = outcome.value;
     state.interests.push(item); state.peopleRecommendationItems.splice(index,1);
     renderPeopleRecommendations(); renderPeople(); renderInterestOptions();
     toast(state.contentType === "music" ? "Исполнитель добавлен" : "Персона добавлена");
-  } catch(error) { button.disabled=false;toast(error.message); }
+  } catch(error) { toast(error.message); }
+}
+
+async function removeRecommendedPerson(index, button) {
+  if (!state.peopleRecommendationItems[index]) return;
+  const outcome = await cardActionWithFeedback(button, () => true, {exit:true});
+  if (!outcome) return;
+  state.peopleRecommendationItems.splice(index,1);
+  renderPeopleRecommendations();
 }
 
 async function runBacklogApiRecommendation(event) {
   event.preventDefault();
   const music = state.contentType === "music", button = $(music ? "#album-api-submit" : "#backlog-api-submit"), errorNode = $(music ? "#album-api-error" : "#backlog-api-error"), resultNode = $("#backlog-recommend-result");
   const values = recommendationValues(event.currentTarget);
+  state.apiPeriod = apiRecommendationPeriod(values);
   if (!music && values.actor_ids.length + values.director_ids.length === 0) {
     const message = "Нужно выбрать хотя бы одного актёра или режиссёра.";
     errorNode.textContent = message;
@@ -1253,20 +1357,23 @@ document.addEventListener("click", async event => {
   const rawResponse = event.target.closest("[data-open-llm-raw-response]"); if (rawResponse) { if(state.llmRawResponse){$("#llm-raw-response-output").textContent=state.llmRawResponse;$("#llm-raw-response-dialog").showModal();}return; }
   const promptPreview = event.target.closest("[data-view-llm-prompt]"); if (promptPreview) { await toggleLlmPromptPreview(promptPreview); return; }
   const close = event.target.closest("[data-close-dialog]"); if (close) { if((close.dataset.closeDialog==="backlog-recommend-dialog"&&activeOperations.recommendation)||(close.dataset.closeDialog==="people-recommend-dialog"&&activeOperations.people)){toast("Сначала остановите текущую рекомендацию");return;}$(`#${close.dataset.closeDialog}`).close(); return; }
-  const sort = event.target.closest("[data-sort]"); if (sort) { const key=sort.dataset.sort; state.sortDirection = state.sortKey === key ? (state.sortDirection === "asc" ? "desc" : "asc") : (key === "planned_soon" ? "desc" : "asc"); state.sortKey=key; renderLibrary(); return; }
+  const sort = event.target.closest("[data-sort]"); if (sort) { const key=sort.dataset.sort; state.sortDirection = state.sortKey === key ? (state.sortDirection === "asc" ? "desc" : "asc") : (["planned_soon","added_at"].includes(key) ? "desc" : "asc"); state.sortKey=key; renderLibrary(); return; }
   const recommendationSort = event.target.closest("[data-recommend-sort]"); if (recommendationSort) { const key=recommendationSort.dataset.recommendSort,setting=state.recommendationSort;setting.direction=setting.key===key&&setting.direction==="asc"?"desc":"asc";setting.key=key;if(state.backlogRecommendMode==="llm")renderLlmRecommendations();else renderApiRecommendations();return; }
   const peopleSort=event.target.closest("[data-people-sort]");if(peopleSort){const role=peopleSort.dataset.peopleRole,key=peopleSort.dataset.peopleSort,setting=state.peopleSort[role];setting.direction=setting.key===key&&setting.direction==="asc"?"desc":"asc";setting.key=key;renderPeople();return;}
+  const peopleRecommendRole=event.target.closest("[data-people-recommend-role]");if(peopleRecommendRole){setPeopleRecommendationRole(peopleRecommendRole.dataset.peopleRecommendRole);return;}
   const trash = event.target.closest("[data-trash-entity]"); if (trash) { await moveToTrash(trash); return; }
   const restore = event.target.closest("[data-restore-id]"); if (restore) { await restoreFromTrash(restore); return; }
   const clearTrashButton = event.target.closest("#clear-trash"); if (clearTrashButton) { await clearTrash(clearTrashButton); return; }
   const details = event.target.closest("[data-details-id]"); if (details) { showDetails(state.items.find(item=>item.id===details.dataset.detailsId)); return; }
+  const personPhoto = event.target.closest("[data-view-person-photo]"); if (personPhoto) { openPersonPhotoViewer(Number(personPhoto.dataset.viewPersonPhoto)); return; }
+  const personExternalLink = event.target.closest("[data-person-external-link]"); if (personExternalLink) return;
   const personDetails = event.target.closest("[data-person-details-id]"); if (personDetails) { showPersonDetails(state.interests.find(item=>item.id===personDetails.dataset.personDetailsId)); return; }
   const addRecommendedPersonButton = event.target.closest("[data-add-recommended-person]"); if (addRecommendedPersonButton) { await addRecommendedPerson(Number(addRecommendedPersonButton.dataset.addRecommendedPerson),addRecommendedPersonButton); return; }
-  const removeRecommendedPersonButton = event.target.closest("[data-remove-recommended-person]"); if (removeRecommendedPersonButton) { state.peopleRecommendationItems.splice(Number(removeRecommendedPersonButton.dataset.removeRecommendedPerson),1);renderPeopleRecommendations();return; }
+  const removeRecommendedPersonButton = event.target.closest("[data-remove-recommended-person]"); if (removeRecommendedPersonButton) { await removeRecommendedPerson(Number(removeRecommendedPersonButton.dataset.removeRecommendedPerson),removeRecommendedPersonButton);return; }
   const modalRecDetails = event.target.closest("[data-modal-rec-details]"); if (modalRecDetails) { const items=state.backlogRecommendMode === "llm" ? state.llmItems : state.apiItems; showDetails(items[Number(modalRecDetails.dataset.modalRecDetails)]); return; }
   const filteredRecDetails = event.target.closest("[data-filtered-rec-details]"); if (filteredRecDetails) { const record=currentFilteredRecommendations()[Number(filteredRecDetails.dataset.filteredRecDetails)];showDetails(record?.item);return; }
   const plannedSoon = event.target.closest("[data-planned-soon-toggle]"); if (plannedSoon) { const item=state.items.find(x=>x.id===plannedSoon.dataset.id);if(item)await patchItemWithFeedback(plannedSoon,item.id,{planned_soon:!item.planned_soon});return; }
-  const itemAction = event.target.closest("[data-item-action]"); if (itemAction) { const action=itemAction.dataset.itemAction;if(action === "backlog")await patchItem(itemAction.dataset.id,{status:"backlog"});else await patchItemWithFeedback(itemAction,itemAction.dataset.id,{status:"consumed",reaction:action},{exit:true});return; }
+  const itemAction = event.target.closest("[data-item-action]"); if (itemAction) { const action=itemAction.dataset.itemAction;await patchItemWithFeedback(itemAction,itemAction.dataset.id,action === "backlog" ? {status:"backlog"} : {status:"consumed",reaction:action},{exit:true});return; }
   const reaction = event.target.closest("[data-reaction-toggle]"); if (reaction) { const item=state.items.find(x=>x.id===reaction.dataset.id);if(item){const next=item.reaction===reaction.dataset.reactionToggle ? "" : reaction.dataset.reactionToggle;await patchItemWithFeedback(reaction,item.id,{reaction:next},{exit:true});}return; }
   const favorite = event.target.closest("[data-favorite-toggle]"); if (favorite) { await toggleFavorite(favorite); return; }
   const modalRecAction = event.target.closest("[data-modal-rec-action]"); if (modalRecAction) { await addModalRecommendation(Number(modalRecAction.dataset.index),modalRecAction.dataset.modalRecAction,modalRecAction); return; }
@@ -1290,6 +1397,7 @@ document.querySelectorAll(".people-filter details").forEach(details=>details.add
 document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => { if (dialog.id === "backlog-recommend-dialog" || (dialog.id === "people-recommend-dialog" && activeOperations.people)) return; const rect=dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); }));
 $("#backlog-recommend-dialog").addEventListener("cancel", event => event.preventDefault());
 $("#people-recommend-dialog").addEventListener("cancel", event => {if(activeOperations.people){event.preventDefault();toast("Сначала остановите текущую рекомендацию");}});
+$("#person-photo-view-dialog").addEventListener("close", () => $("#person-photo-view-image").removeAttribute("src"));
 
 document.querySelectorAll("[data-library-search]").forEach(input => input.addEventListener("input", event => { state.query=event.target.value;syncSearchControls();renderLibrary();renderPeople(); })); $("#refresh-tmdb").addEventListener("click", refreshTmdb); $("#refresh-people").addEventListener("click", refreshPeople); $("#refresh-detail").addEventListener("click", refreshCurrentMovie); $("#refresh-person-detail").addEventListener("click", refreshCurrentPerson);
 $("#open-people-recommend").addEventListener("click",openPeopleRecommendation); $("#people-recommend-form").addEventListener("submit",runPeopleRecommendation);

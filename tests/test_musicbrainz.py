@@ -146,6 +146,8 @@ class MusicBrainzTests(unittest.TestCase):
         storage.add_item({
             "content_type":"music", "title_original":"Complete", "title_ru":"Complete",
             "artists":"Artist", "release_group_mbid":"rg-complete",
+            "first_release_date":"2024-01-01", "track_count":10,
+            "musicbrainz_updated_at":"2026-01-01T00:00:00+00:00",
             "cover_url":cover.format("rg-complete"), "cover_path":"albums/rg-complete.jpg",
             "total_listen_count":100,
         })
@@ -177,6 +179,44 @@ class MusicBrainzTests(unittest.TestCase):
         self.assertEqual(result["updated"], 1)
         self.assertEqual(storage.get_item(missing["id"])["total_listen_count"], 321)
 
+    def test_refresh_artist_requests_musicbrainz_and_fanart(self) -> None:
+        target = {
+            "id":"artist-one", "name_original":"Portishead", "name_ru":"Portishead",
+            "mbid":"artist-portishead",
+        }
+        details = {**target, "profile_url":"https://fanart.test/portishead.jpg"}
+        with patch.object(musicbrainz.storage,"list_music_artists",return_value=[target]), \
+             patch.object(musicbrainz,"resolve_artist_input",return_value=details) as resolve, \
+             patch.object(musicbrainz.storage,"update_music_artist",return_value=details) as save:
+            result = musicbrainz.refresh_artist("artist-one")
+        resolve.assert_called_once_with(target, include_artwork=True)
+        save.assert_called_once_with("artist-one", details)
+        self.assertEqual(result["profile_url"], "https://fanart.test/portishead.jpg")
+
+    def test_refresh_album_requests_metadata_artwork_and_popularity(self) -> None:
+        target = {
+            "id":"album-one", "content_type":"music", "title_original":"Dummy",
+            "release_group_mbid":"rg-one", "artists":"Artist", "first_release_date":"",
+            "track_count":"", "primary_type":"Album", "musicbrainz_updated_at":"",
+            "cover_path":"", "total_listen_count":None,
+        }
+        details = {
+            **target, "first_release_date":"2024-01-01", "track_count":10,
+            "cover_url":"https://cover.test/rg-one.jpg", "cover_path":"albums/rg-one.jpg",
+        }
+        final = {**details, "total_listen_count":123}
+        with patch.object(musicbrainz.storage,"get_item",side_effect=[target,final]), \
+             patch.object(musicbrainz,"resolve_album_input",return_value=details) as resolve, \
+             patch.object(musicbrainz.storage,"update_album_from_provider",return_value=details) as save, \
+             patch.object(musicbrainz.listenbrainz,"release_group_popularity",return_value={"rg-one":123}) as popularity, \
+             patch.object(musicbrainz.storage,"update_album_popularity") as save_popularity:
+            result = musicbrainz.refresh_album("album-one")
+        resolve.assert_called_once_with(target, fetch_popularity=False)
+        save.assert_called_once_with("album-one", details)
+        popularity.assert_called_once_with(["rg-one"])
+        save_popularity.assert_called_once_with({"rg-one":123})
+        self.assertEqual(result["total_listen_count"], 123)
+
     def test_bootstrap_browse_keeps_only_primary_studio_albums(self) -> None:
         response = {"release-groups":[
             {"id":"studio","title":"Studio","first-release-date":"2026-01-01","primary-type":"Album","secondary-types":[],"artist-credit":[]},
@@ -194,6 +234,7 @@ class MusicBrainzTests(unittest.TestCase):
         artist = storage.add_music_artist({"content_type":"music","name":"Artist","mbid":"artist-1"})
         candidates = [
             {"release_group_mbid":"studio","title_original":"Studio","year":2026,"secondary_types":[]},
+            {"release_group_mbid":"old","title_original":"Old","year":1899,"secondary_types":[]},
             {"release_group_mbid":"deluxe","title_original":"Studio Deluxe Edition","year":2026,"secondary_types":[]},
             {"release_group_mbid":"soundtrack","title_original":"Score","year":2026,"secondary_types":["Soundtrack"]},
             {"release_group_mbid":"dj-mix","title_original":"DJ mix","year":2026,"secondary_types":["DJ-mix"]},
