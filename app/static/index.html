@@ -31,6 +31,8 @@
                 <button type="button" data-content-type="music" aria-pressed="false">Музыка</button>
               </div>
               <span id="backlog-count" class="count" aria-label="Количество в очереди"></span>
+              <span class="toolbar-context-divider" aria-hidden="true"></span>
+              <button id="open-backlog-planning" class="button planning-cta" type="button"><svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 2v4M16 2v4M3 10h18"/><rect x="3" y="4" width="18" height="18" rx="2"/><path d="m8.5 16 2 2 5-5"/></svg>Запланировать</button>
             </div>
             <div class="toolbar-actions">
               <button id="open-backlog-recommend" class="button primary" type="button">✦ Подобрать похожее</button>
@@ -178,6 +180,45 @@
     <label>Название исполнителя или группы<input name="name" required></label><label>MusicBrainz ID (необязательно)<input name="mbid"></label>
   </div><p id="add-artist-resolve-status" class="notice hidden"></p><p id="add-artist-error" class="error"></p><div class="dialog-actions"><button type="button" class="button secondary" data-close-dialog="add-artist-dialog">Отмена</button><button id="resolve-artist" type="button" class="button secondary">↻ Актуализировать из MusicBrainz</button><button class="button primary" type="submit">Добавить исполнителя</button></div></form></dialog>
 
+  <dialog id="backlog-planning-dialog" class="recommend-dialog planning-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">Codex · выбор из вашего бэклога</p><h2 id="planning-title">Что посмотреть сейчас</h2></div><button class="dialog-close" type="button" data-close-dialog="backlog-planning-dialog">×</button></div>
+    <form id="backlog-planning-form">
+      <section class="planning-suggestions" aria-labelledby="planning-suggestions-title">
+        <div class="planning-suggestions-head"><h3 id="planning-suggestions-title">Настроение фильмов в бэклоге</h3><button id="refresh-planning-moods" class="mini-button planning-moods-refresh" type="button">↻ Обновить</button></div>
+        <div id="planning-mood-chips" class="planning-mood-chips" tabindex="0" aria-label="Варианты настроения, горизонтальный список"></div>
+      </section>
+      <section class="planning-period-panel" aria-labelledby="planning-period-title">
+        <h3 id="planning-period-title">Период</h3>
+        <div class="planning-period-chips" role="group" aria-label="Период выпуска">
+          <button type="button" class="planning-mood-chip planning-period-chip" data-planning-period="before_1980" aria-pressed="false">до 1980-х</button>
+          <button type="button" class="planning-mood-chip planning-period-chip" data-planning-period="1980_2000" aria-pressed="false">1980–2000</button>
+          <button type="button" class="planning-mood-chip planning-period-chip" data-planning-period="2000_2010" aria-pressed="false">2000–2010</button>
+          <button type="button" class="planning-mood-chip planning-period-chip" data-planning-period="2010_2020" aria-pressed="false">2010–2020</button>
+          <button type="button" class="planning-mood-chip planning-period-chip" data-planning-period="after_2020" aria-pressed="false">после 2020-х</button>
+          <button type="button" class="planning-mood-chip planning-period-chip" data-planning-period="modern" aria-pressed="false">современное</button>
+          <button type="button" class="planning-mood-chip planning-period-chip" data-planning-period="old" aria-pressed="false">старое</button>
+          <button type="button" class="planning-mood-chip planning-period-chip" data-planning-period="classic" aria-pressed="false">классическое</button>
+        </div>
+      </section>
+      <label class="recommend-prompt-label" for="planning-mood">Какое у вас настроение?<textarea id="planning-mood" name="mood" rows="5" maxlength="2000" required placeholder="Например: хочу напряжённое, визуально сильное кино без тяжёлого послевкусия"></textarea></label>
+      <div class="planning-filter-row">
+        <label class="filter-control" for="planning-limit"><span id="planning-limit-label">Макс. кол-во фильмов</span><input id="planning-limit" name="limit" type="number" min="1" max="20" value="5" required></label>
+        <p id="planning-context-note" class="recommend-context-note">Codex выберет только из фильмов, уже добавленных в ваш бэклог. Объяснения модели останутся только в этом окне.</p>
+      </div>
+      <p id="backlog-planning-error" class="error"></p>
+      <div class="dialog-actions"><span id="backlog-planning-provider" class="api-badge">Codex SDK</span><button id="backlog-planning-submit" class="button primary" type="submit">Подобрать</button></div>
+    </form>
+    <div id="planning-progress" class="recommend-progress hidden" role="status" aria-live="polite">
+      <div class="operation-progress-head"><button id="planning-stop" class="mini-button operation-stop hidden" type="button" data-stop-operation="planning">Стоп</button></div>
+      <div id="planning-progress-stages"></div>
+    </div>
+    <section id="backlog-planning-result" class="llm-modal-result hidden" aria-live="polite">
+      <div class="section-bar compact"><div><p class="eyebrow">Из вашего бэклога</p><h2 id="planning-result-title">Подходящие фильмы</h2></div><div class="section-actions"><span id="backlog-planning-model" class="api-badge"></span><button class="icon-button result-size-toggle" type="button" data-result-size-toggle="backlog-planning-dialog" title="Увеличить таблицу" aria-label="Увеличить таблицу" aria-pressed="false"><svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3H3v6M15 3h6v6M21 15v6h-6M9 21H3v-6"/></svg></button></div></div>
+      <p id="backlog-planning-message" class="notice"></p>
+      <div class="table-wrap"><table class="movie-table planning-table"><thead id="backlog-planning-head"></thead><tbody id="backlog-planning-body"></tbody></table></div>
+    </section>
+  </dialog>
+
   <dialog id="backlog-recommend-dialog" class="recommend-dialog">
     <div class="dialog-head"><div><p id="recommend-eyebrow" class="eyebrow">Codex · персональный подбор</p><h2 id="recommend-title">Подобрать похожие фильмы</h2></div><button class="dialog-close" type="button" data-close-dialog="backlog-recommend-dialog">×</button></div>
     <form id="backlog-recommend-form">
@@ -249,7 +290,7 @@
     </div>
     <p id="backlog-recommend-warning" class="notice warning hidden"></p>
     <section id="backlog-recommend-result" class="llm-modal-result hidden">
-      <div class="section-bar compact"><div><p id="backlog-recommend-result-source" class="eyebrow">Codex + TMDB + OMDb + Кинопоиск</p><h2>Рекомендации</h2></div><div class="section-actions"><button id="open-llm-raw-response" class="mini-button hidden" type="button" data-open-llm-raw-response>Сырой ответ модели</button><span id="backlog-recommend-model" class="api-badge"></span></div></div>
+      <div class="section-bar compact"><div><p id="backlog-recommend-result-source" class="eyebrow">Codex + TMDB + OMDb + Кинопоиск</p><h2>Рекомендации</h2></div><div class="section-actions"><button id="open-llm-raw-response" class="mini-button hidden" type="button" data-open-llm-raw-response>Сырой ответ модели</button><span id="backlog-recommend-model" class="api-badge"></span><button class="icon-button result-size-toggle" type="button" data-result-size-toggle="backlog-recommend-dialog" title="Увеличить таблицу" aria-label="Увеличить таблицу" aria-pressed="false"><svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3H3v6M15 3h6v6M21 15v6h-6M9 21H3v-6"/></svg></button></div></div>
       <div class="notice recommendation-summary-row"><span id="backlog-recommend-message"></span><button id="open-filtered-reasons" class="mini-button hidden" type="button" data-open-filtered-reasons>Подробнее</button></div>
       <div class="table-wrap"><table class="movie-table llm-recommend-table"><thead id="backlog-recommend-head"><tr>
         <th>Название</th><th>Дата выхода</th><th>Режиссёр</th><th>IMDb / КП</th><th>Страны</th><th>Жанр</th><th>Ключевые персоны</th><th>Заметка</th><th>Link</th><th>Действия</th>

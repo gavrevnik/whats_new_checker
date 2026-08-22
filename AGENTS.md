@@ -28,4 +28,8 @@
 - Follow the existing standard-library Python server and vanilla HTML/CSS/JavaScript architecture unless the user requests a framework change.
 - Reuse existing storage, TMDB, OMDb, Kinopoisk, MusicBrainz, ListenBrainz, fanart.tv, artwork, modal, and card helpers instead of creating parallel implementations.
 - Preserve the Russian/original naming pair for movies and people throughout storage, API responses, and UI. Preserve canonical MusicBrainz names, MBIDs, release-group identities, and ordered artist credits for music.
-- Update `README.md` when setup, behavior, API contracts, or user-facing workflows change materially.
+
+## Documentation
+
+- After every significant change, review the relevant `README.md` sections before handing off and update them in the same task when setup, architecture, storage, API contracts, integrations, limitations, or user-facing workflows changed.
+- Do not create documentation churn for an internal refactor or small bug fix that leaves documented behavior and operating instructions unchanged.

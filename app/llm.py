@@ -19,6 +19,8 @@ RUNNER = ROOT / "scripts" / "run_codex_recommendation.py"
 SCHEMA_PATH = ROOT / "app" / "movie_recommendations.schema.json"
 ALBUM_SCHEMA_PATH = ROOT / "app" / "album_recommendations.schema.json"
 PERSON_SCHEMA_PATH = ROOT / "app" / "person_recommendations.schema.json"
+PLANNING_SCHEMA_PATH = ROOT / "app" / "backlog_planning.schema.json"
+MOODS_SCHEMA_PATH = ROOT / "app" / "backlog_moods.schema.json"
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 DEFAULT_MODEL = "gpt-5.6-terra"
 BASE_INSTRUCTIONS = """You are a personal movie and music recommendation assistant.
@@ -27,6 +29,16 @@ modify anything, or ask follow-up questions. Use only the context included in th
 knowledge. Return only JSON that strictly matches the supplied output schema. Do not wrap it in
 Markdown, add prose outside the JSON, or change the field names.
 """
+PLANNING_PERIODS: dict[str, tuple[str, int | None, int | None]] = {
+    "before_1980": ("до 1980-х", None, 1979),
+    "1980_2000": ("1980–2000", 1980, 2000),
+    "2000_2010": ("2000–2010", 2000, 2010),
+    "2010_2020": ("2010–2020", 2010, 2020),
+    "after_2020": ("после 2020-х", 2021, None),
+    "modern": ("современное", 2010, None),
+    "old": ("старое", 1980, 2009),
+    "classic": ("классическое", None, 1979),
+}
 
 
 class LlmError(RuntimeError):
@@ -83,6 +95,8 @@ def configuration() -> dict[str, Any]:
     return {
         "configured": all(path.exists() for path in (
             VENV_PYTHON, RUNNER, SCHEMA_PATH, ALBUM_SCHEMA_PATH, PERSON_SCHEMA_PATH,
+            PLANNING_SCHEMA_PATH,
+            MOODS_SCHEMA_PATH,
         )),
         "provider": "Codex SDK",
         "model": get_model(),
@@ -669,6 +683,267 @@ def build_recommendation_prompt(payload: dict[str, Any]) -> str:
         "Apply every enabled filter before choosing recommendations:\n\n"
         f"{contract}"
     )
+
+
+def _planning_item(item: dict[str, Any], content_type: str) -> dict[str, Any]:
+    common = {
+        "id": str(item.get("id") or ""),
+        "title_ru": str(item.get("title_ru") or ""),
+        "title_original": str(item.get("title_original") or ""),
+        "year": item.get("year"),
+        "genres": str(item.get("genres") or ""),
+        "notes": str(item.get("notes") or "")[:300],
+        "already_planned": bool(item.get("planned_soon")),
+    }
+    if content_type == "music":
+        return {
+            **common,
+            "artists": str(item.get("artists") or ""),
+            "release_date": str(item.get("first_release_date") or ""),
+            "release_types": " · ".join(
+                value for value in (
+                    str(item.get("primary_type") or ""),
+                    str(item.get("secondary_types") or ""),
+                ) if value
+            ),
+            "track_count": item.get("track_count"),
+            "annotation": str(item.get("annotation") or "")[:600],
+        }
+    return {
+        **common,
+        "release_date": str(item.get("release_date") or ""),
+        "directors": str(item.get("directors") or ""),
+        "countries": str(item.get("countries") or ""),
+        "runtime_minutes": item.get("duration_minutes"),
+        "imdb_rating": item.get("imdb_rating"),
+        "kinopoisk_rating": item.get("kinopoisk_rating"),
+        "key_people": str(item.get("key_people") or ""),
+        "overview": str(item.get("overview") or "")[:600],
+    }
+
+
+def _planning_backlog(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    content_type = str(payload.get("content_type") or "movie")
+    backlog = storage.list_library(content_type=content_type, status="backlog")
+    period = str(payload.get("period") or "").strip()
+    if not period:
+        return backlog, ""
+    if period not in PLANNING_PERIODS:
+        raise LlmError("Неизвестный период")
+    label, year_from, year_to = PLANNING_PERIODS[period]
+    filtered: list[dict[str, Any]] = []
+    for item in backlog:
+        raw_year = item.get("year") or str(item.get("release_date") or item.get("first_release_date") or "")[:4]
+        try:
+            year = int(raw_year)
+        except (TypeError, ValueError):
+            continue
+        if year_from is not None and year < year_from:
+            continue
+        if year_to is not None and year > year_to:
+            continue
+        filtered.append(item)
+    if not filtered:
+        raise LlmError(f"В бэклоге нет подходящих позиций за период «{label}»")
+    return filtered, label
+
+
+def build_planning_prompt(payload: dict[str, Any]) -> str:
+    content_type = str(payload.get("content_type") or "movie")
+    if content_type not in {"movie", "music"}:
+        raise LlmError("Неизвестный тип контента")
+    mood = str(payload.get("mood") or "").strip()
+    if not mood:
+        raise LlmError("Опишите настроение")
+    if len(mood) > 2000:
+        raise LlmError("Описание настроения слишком длинное")
+    limit = int(_number(payload, "limit", 5, 1, 20))
+    backlog, period_label = _planning_backlog(payload)
+    if not backlog:
+        raise LlmError("В бэклоге пока нечего планировать")
+    requested = min(limit, len(backlog))
+    entity = "фильмов" if content_type == "movie" else "альбомов"
+    action = "посмотреть" if content_type == "movie" else "послушать"
+    candidates = "\n".join(
+        json.dumps(_planning_item(item, content_type), ensure_ascii=False, separators=(",", ":"))
+        for item in backlog
+    )
+    contract = "\n\n".join([
+        f"Задача: выбери из предоставленного бэклога топ-{requested} {entity}, которые лучше всего {action} именно сейчас.",
+        f"Настроение и пожелания пользователя:\n{mood}",
+        f"Выбранный период выпуска: {period_label}. Все позиции ниже уже соответствуют этому жёсткому условию."
+        if period_label else "Период выпуска не ограничен.",
+        "Используй только объекты из списка ниже и возвращай их id без изменений. Не придумывай новые произведения, "
+        "не заменяй объекты похожими и не повторяй один id. Ранжируй прежде всего по соответствию настроению; "
+        "флаг already_planned можно использовать только как слабый дополнительный сигнал и нельзя считать фильтром.",
+        f"Верни не более {requested} позиций. Для каждой дай на русском короткое конкретное объяснение в 1–2 предложениях, "
+        "почему именно это произведение подходит под указанное настроение. Не пересказывай технические поля и не используй Markdown.",
+        f"Полный бэклог ({len(backlog)} объектов, один JSON-объект на строку):\n{candidates}",
+        "Формат ответа задаётся JSON Schema. Верни только JSON-объект с массивом items; у каждой позиции обязательны "
+        "поля id и reason.",
+    ])
+    return (
+        f"{BASE_INSTRUCTIONS}\n\n"
+        "The following backlog planning contract is mandatory system-level context. "
+        "Choose only from the supplied backlog:\n\n"
+        f"{contract}"
+    )
+
+
+def build_backlog_moods_prompt(payload: dict[str, Any]) -> str:
+    content_type = str(payload.get("content_type") or "movie")
+    if content_type not in {"movie", "music"}:
+        raise LlmError("Неизвестный тип контента")
+    backlog = storage.list_library(content_type=content_type, status="backlog")
+    if not backlog:
+        raise LlmError("В бэклоге пока нечего анализировать")
+    entity = "фильмы" if content_type == "movie" else "альбомы"
+    candidates = "\n".join(
+        json.dumps(_planning_item(item, content_type), ensure_ascii=False, separators=(",", ":"))
+        for item in backlog
+    )
+    contract = "\n\n".join([
+        f"Задача: сгруппируй {entity} из текущего бэклога по настроению и верни до 15 коротких категорий на русском.",
+        "Категории должны описывать эмоциональный тон, атмосферу или подходящий сценарий просмотра/прослушивания, "
+        "которые действительно представлены объектами списка. Покрой разнообразие всего бэклога, но объединяй близкие варианты.",
+        "Каждая категория — самостоятельная естественная фраза из 2–6 слов в нижнем регистре, например «мрачный корейский триллер». "
+        "Не используй названия произведений, имена авторов, нумерацию, Markdown и пояснения. Не повторяй категории и не предлагай "
+        "настроения, для которых в списке нет подходящих объектов.",
+        f"Полный бэклог ({len(backlog)} объектов, один JSON-объект на строку):\n{candidates}",
+        "Формат ответа задаётся JSON Schema. Верни только JSON-объект с массивом moods.",
+    ])
+    return (
+        f"{BASE_INSTRUCTIONS}\n\n"
+        "The following backlog mood mapping contract is mandatory system-level context. "
+        "Use only the supplied backlog:\n\n"
+        f"{contract}"
+    )
+
+
+def _parse_backlog_moods(raw: str) -> list[str]:
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise LlmError(f"Codex вернул ответ, который не удалось разобрать как JSON: {error}") from error
+    moods = response.get("moods") if isinstance(response, dict) else None
+    if not isinstance(moods, list):
+        raise LlmError("Codex вернул JSON без массива moods")
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for mood in moods:
+        value = str(mood or "").strip()
+        normalized = value.casefold()
+        if not value or normalized in seen:
+            continue
+        parsed.append(value[:80])
+        seen.add(normalized)
+        if len(parsed) >= 15:
+            break
+    if not parsed:
+        raise LlmError("Codex не вернул настроения для бэклога")
+    return parsed
+
+
+def suggest_backlog_moods(payload: dict[str, Any]) -> dict[str, Any]:
+    progress_id = payload.get("progress_id")
+    recommendation_progress.start(
+        progress_id, 1, stage_id="planning-moods-request", label="Codex · настроения бэклога", unit="запросов",
+    )
+    try:
+        prompt = build_backlog_moods_prompt(payload)
+        if not VENV_PYTHON.exists():
+            raise LlmError(
+                "Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+            )
+        model = get_model()
+        completed = _run_codex(prompt, model, MOODS_SCHEMA_PATH, progress_id)
+        if completed is None:
+            return {"moods": [], "model": model, "cancelled": True}
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
+            raise LlmError(f"Codex SDK: {message[-1200:]}")
+        answer = completed.stdout.strip()
+        if not answer:
+            raise LlmError("Codex вернул пустой ответ")
+        moods = _parse_backlog_moods(answer)
+        recommendation_progress.finish_stage(progress_id, "planning-moods-request")
+        return {
+            "moods": moods,
+            "model": model,
+            "cancelled": recommendation_progress.is_cancelled(progress_id),
+        }
+    finally:
+        recommendation_progress.finish(progress_id)
+
+
+def _parse_planning_response(raw: str) -> list[dict[str, str]]:
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise LlmError(f"Codex вернул ответ, который не удалось разобрать как JSON: {error}") from error
+    choices = response.get("items") if isinstance(response, dict) else None
+    if not isinstance(choices, list):
+        raise LlmError("Codex вернул JSON без массива items")
+    parsed: list[dict[str, str]] = []
+    for index, choice in enumerate(choices, start=1):
+        if not isinstance(choice, dict):
+            raise LlmError(f"Позиция {index} в ответе Codex имеет неверный формат")
+        item_id = str(choice.get("id") or "").strip()
+        reason = str(choice.get("reason") or "").strip()
+        if not item_id or not reason:
+            raise LlmError(f"У позиции {index} не заполнены обязательные поля")
+        parsed.append({"id": item_id, "reason": reason})
+    return parsed
+
+
+def recommend_backlog(payload: dict[str, Any]) -> dict[str, Any]:
+    progress_id = payload.get("progress_id")
+    recommendation_progress.start(
+        progress_id, 1, stage_id="planning-request", label="Codex · выбор из бэклога", unit="запросов",
+    )
+    try:
+        prompt = build_planning_prompt(payload)
+        if not VENV_PYTHON.exists():
+            raise LlmError(
+                "Codex SDK не установлен. Выполните: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+            )
+        model = get_model()
+        completed = _run_codex(prompt, model, PLANNING_SCHEMA_PATH, progress_id)
+        if completed is None:
+            return {"items": [], "model": model, "requested": 0, "received": 0, "cancelled": True}
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or completed.stdout.strip() or "unknown Codex SDK error"
+            raise LlmError(f"Codex SDK: {message[-1200:]}")
+        answer = completed.stdout.strip()
+        if not answer:
+            raise LlmError("Codex вернул пустой ответ")
+        choices = _parse_planning_response(answer)
+        content_type = str(payload.get("content_type") or "movie")
+        limit = int(_number(payload, "limit", 5, 1, 20))
+        backlog, _ = _planning_backlog(payload)
+        by_id = {str(item.get("id") or ""): item for item in backlog}
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for choice in choices:
+            item_id = choice["id"]
+            if item_id in seen or item_id not in by_id:
+                continue
+            item = dict(by_id[item_id])
+            item["planning_reason"] = choice["reason"]
+            items.append(item)
+            seen.add(item_id)
+            if len(items) >= limit:
+                break
+        recommendation_progress.finish_stage(progress_id, "planning-request")
+        return {
+            "items": items,
+            "model": model,
+            "requested": min(limit, len(backlog)),
+            "received": len(choices),
+            "cancelled": recommendation_progress.is_cancelled(progress_id),
+        }
+    finally:
+        recommendation_progress.finish(progress_id)
 
 
 def build_people_prompt(payload: dict[str, Any]) -> str:

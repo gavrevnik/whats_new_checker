@@ -118,6 +118,134 @@ class LlmTests(unittest.TestCase):
         self.assertIn("mandatory system-level context", prompt)
         self.assertIn("Тихая фантастика", prompt)
 
+    def test_planning_prompt_contains_only_the_complete_current_backlog(self) -> None:
+        backlog = storage.list_library(content_type="movie", status="backlog")
+        prompt = llm.build_planning_prompt({
+            "content_type":"movie", "mood":"Мрачная атмосферная фантастика", "limit":"7",
+        })
+        self.assertIn("Мрачная атмосферная фантастика", prompt)
+        self.assertIn("Дюна: Часть вторая", prompt)
+        self.assertIn(f'"id":"{backlog[0]["id"]}"', prompt)
+        self.assertNotIn("Прибытие (Arrival)", prompt)
+        self.assertIn("топ-1 фильмов", prompt)
+        self.assertIn("выбери из предоставленного бэклога", prompt.lower())
+
+    def test_music_planning_prompt_uses_album_backlog(self) -> None:
+        storage.add_item({
+            "content_type":"music", "title_original":"Mezzanine", "title_ru":"Mezzanine",
+            "artists":"Massive Attack", "year":"1998", "status":"backlog", "genres":"trip hop",
+        })
+        prompt = llm.build_planning_prompt({
+            "content_type":"music", "mood":"Сумрачный трип-хоп на вечер", "limit":"5",
+        })
+        self.assertIn("Mezzanine", prompt)
+        self.assertIn("Massive Attack", prompt)
+        self.assertIn("послушать именно сейчас", prompt)
+        self.assertNotIn("Дюна: Часть вторая", prompt)
+
+    def test_backlog_moods_prompt_maps_only_current_backlog(self) -> None:
+        prompt = llm.build_backlog_moods_prompt({"content_type":"movie"})
+        self.assertIn("до 15 коротких категорий", prompt)
+        self.assertIn("Дюна: Часть вторая", prompt)
+        self.assertNotIn('"title_original":"Arrival"', prompt)
+        self.assertIn("JSON-объект с массивом moods", prompt)
+
+    def test_backlog_moods_use_dedicated_schema_and_remove_duplicates(self) -> None:
+        response = {"moods":[
+            "мрачная научная фантастика", "Эпическое приключение",
+            "мрачная научная фантастика", "",
+        ]}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(response, ensure_ascii=False), "")
+        with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
+             patch.object(llm, "get_model", return_value="test-model"), \
+             patch.object(llm, "_run_codex", return_value=completed) as run:
+            result = llm.suggest_backlog_moods({
+                "content_type":"movie", "progress_id":"planning-moods-job",
+            })
+        self.assertEqual(result["moods"], ["мрачная научная фантастика", "Эпическое приключение"])
+        self.assertEqual(result["model"], "test-model")
+        self.assertEqual(run.call_args.args[2], llm.MOODS_SCHEMA_PATH)
+        progress = llm.recommendation_progress.get("planning-moods-job")
+        self.assertEqual([stage["id"] for stage in progress["stages"]], ["planning-moods-request"])
+        self.assertTrue(progress["complete"])
+
+    def test_planning_period_is_a_hard_backlog_filter(self) -> None:
+        old = storage.add_item({
+            "content_type":"movie", "title_original":"Old Film", "title_ru":"Старый фильм",
+            "year":"1975", "status":"backlog",
+        })
+        recent = next(
+            item for item in storage.list_library(content_type="movie", status="backlog")
+            if item["title_original"] == "Dune: Part Two"
+        )
+        response = {"items":[
+            {"id":old["id"], "reason":"Не должен пройти период."},
+            {"id":recent["id"], "reason":"Современная фантастика."},
+        ]}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(response, ensure_ascii=False), "")
+        with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
+             patch.object(llm, "_run_codex", return_value=completed):
+            result = llm.recommend_backlog({
+                "content_type":"movie", "mood":"Фантастика", "period":"after_2020",
+                "limit":"5", "progress_id":"planning-period-job",
+            })
+        self.assertEqual([item["id"] for item in result["items"]], [recent["id"]])
+        prompt = llm.build_planning_prompt({
+            "content_type":"movie", "mood":"Фантастика", "period":"after_2020", "limit":"5",
+        })
+        self.assertIn("Выбранный период выпуска: после 2020-х", prompt)
+        self.assertIn("Dune: Part Two", prompt)
+        self.assertNotIn("Old Film", prompt)
+
+    def test_planning_rejects_unknown_period(self) -> None:
+        with self.assertRaises(llm.LlmError):
+            llm.build_planning_prompt({
+                "content_type":"movie", "mood":"Драма", "period":"unknown",
+            })
+
+    def test_broad_planning_period_presets_use_documented_ranges(self) -> None:
+        old = storage.add_item({
+            "content_type":"movie", "title_original":"Old Film", "title_ru":"Старый фильм",
+            "year":"1995", "status":"backlog",
+        })
+        classic = storage.add_item({
+            "content_type":"movie", "title_original":"Classic Film", "title_ru":"Классика",
+            "year":"1975", "status":"backlog",
+        })
+        modern_items, modern_label = llm._planning_backlog({"content_type":"movie", "period":"modern"})
+        old_items, old_label = llm._planning_backlog({"content_type":"movie", "period":"old"})
+        classic_items, classic_label = llm._planning_backlog({"content_type":"movie", "period":"classic"})
+        self.assertEqual(modern_label, "современное")
+        self.assertIn("Dune: Part Two", {item["title_original"] for item in modern_items})
+        self.assertEqual((old_label, [item["id"] for item in old_items]), ("старое", [old["id"]]))
+        self.assertEqual((classic_label, [item["id"] for item in classic_items]), ("классическое", [classic["id"]]))
+
+    def test_planning_recommendation_accepts_only_backlog_ids_without_persisting_reason(self) -> None:
+        backlog_item = storage.list_library(content_type="movie", status="backlog")[0]
+        response = {"items":[
+            {"id":backlog_item["id"], "reason":"Масштабная фантастика соответствует настроению."},
+            {"id":"invented-id", "reason":"Модель придумала этот объект."},
+            {"id":backlog_item["id"], "reason":"Повтор того же фильма."},
+        ]}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(response, ensure_ascii=False), "")
+        with patch.object(llm, "VENV_PYTHON", Path(sys.executable)), \
+             patch.object(llm, "get_model", return_value="test-model"), \
+             patch.object(llm, "_run_codex", return_value=completed) as run:
+            result = llm.recommend_backlog({
+                "content_type":"movie", "mood":"Эпическая фантастика", "limit":"5",
+                "progress_id":"planning-job",
+            })
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["id"], backlog_item["id"])
+        self.assertEqual(result["items"][0]["planning_reason"], "Масштабная фантастика соответствует настроению.")
+        stored = storage.get_item(backlog_item["id"])
+        self.assertNotIn("planning_reason", stored)
+        self.assertFalse(stored["planned_soon"])
+        self.assertEqual(run.call_args.args[2], llm.PLANNING_SCHEMA_PATH)
+        progress = llm.recommendation_progress.get("planning-job")
+        self.assertEqual([stage["id"] for stage in progress["stages"]], ["planning-request"])
+        self.assertTrue(progress["complete"])
+
     def test_recommendation_invokes_isolated_sdk_runner(self) -> None:
         response = {"movies":[{
             "title_ru":"Тест", "title_original":"Test", "year":2024, "comment":"Подходит по настроению",

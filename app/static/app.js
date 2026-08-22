@@ -1,9 +1,21 @@
-const state = { items: [], interests: [], trash: [], view: "backlog", contentType: "movie", backlogRecommendMode: "llm", query: "", apiItems: [], apiFilteredItems: [], apiPeriod: "", llmItems: [], llmFilteredItems: [], llmErrors: [], llmRawResponse: "", recommendationCancelled: false, peopleRecommendationItems: [], peopleRecommendationErrors: [], peopleRecommendationCancelled: false, apiProgressWarnings: [], recommendationSort: {key:"year",direction:"desc"}, tmdb: {}, musicbrainz: {}, llm: {}, llmContextSeed: "", sortKey: "release_date", sortDirection: "desc", peopleSort: {director:{key:"name_ru",direction:"asc"},actor:{key:"name_ru",direction:"asc"},artist:{key:"name_original",direction:"asc"}}, currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingAlbumDetails: null, pendingPersonDetails: null, pendingArtistDetails: null, pendingMovieRaw: null, pendingAlbumRaw: null, pendingPersonRaw: null, pendingArtistRaw: null, pendingMovieSearchField: "", pendingAlbumSearchField: "" };
-const activeOperations = {recommendation:"",people:"",refresh:""};
+const state = { items: [], interests: [], trash: [], view: "backlog", contentType: "movie", backlogRecommendMode: "llm", query: "", apiItems: [], apiFilteredItems: [], apiPeriod: "", llmItems: [], llmFilteredItems: [], llmErrors: [], llmRawResponse: "", recommendationCancelled: false, planningItems: [], planningMoods: [], selectedPlanningMoods: [], planningPeriod: "", planningCancelled: false, peopleRecommendationItems: [], peopleRecommendationErrors: [], peopleRecommendationCancelled: false, apiProgressWarnings: [], recommendationSort: {key:"year",direction:"desc"}, tmdb: {}, musicbrainz: {}, llm: {}, llmContextSeed: "", sortKey: "release_date", sortDirection: "desc", peopleSort: {director:{key:"name_ru",direction:"asc"},actor:{key:"name_ru",direction:"asc"},artist:{key:"name_original",direction:"asc"}}, currentDetailId: "", currentPersonId: "", pendingMovieDetails: null, pendingAlbumDetails: null, pendingPersonDetails: null, pendingArtistDetails: null, pendingMovieRaw: null, pendingAlbumRaw: null, pendingPersonRaw: null, pendingArtistRaw: null, pendingMovieSearchField: "", pendingAlbumSearchField: "" };
+const activeOperations = {recommendation:"",planning:"",people:"",refresh:""};
 const operationRunning = () => Object.values(activeOperations).some(Boolean);
 let contentTypeSwitching = false;
 const $ = selector => document.querySelector(selector);
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
+const planningMoodSuggestions = {
+  movie: [
+    "добротный боевик с характером", "мрачный корейский триллер", "медленное фестивальное кино", "тёплая гуманистическая драма", "атмосферная научная фантастика",
+    "сильная историческая драма", "горькая комедия без пошлости", "визуально роскошное авторское кино", "напряжённая военная драма", "лёгкий вечер без тяжёлого послевкусия",
+    "экзистенциальная драма", "азиатское авторское кино", "поэтичная мелодрама", "классика ужасов", "музыкальная биография",
+  ],
+  music: [
+    "сумрачная атмосферная электроника", "интимный трип-хоп на вечер", "ритуальный неофолк и эмбиент", "меланхоличный dream pop", "тяжёлое, но красивое звучание",
+    "арт-поп с необычным продакшеном", "музыка для глубокой концентрации", "энергичный альтернативный рок", "мрачный женский вокал", "мягкая психоделика для ночной прогулки",
+    "синт-поп с женским вокалом", "эмбиент без вокала", "мрачный альтернативный метал", "психоделический поп-рок", "кинематографичный арт-рок",
+  ],
+};
 
 async function request(url, options = {}) {
   const response = await fetch(url, { headers: {"Content-Type":"application/json"}, ...options });
@@ -39,8 +51,24 @@ function actionIcon(name) {
     dislike: `<g transform="rotate(180 12 12)">${thumb}</g>`,
     trash: `<path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6M14 11v6"/>`,
     calendarCheck: `<path d="M8 2v4M16 2v4M3 10h18"/><rect x="3" y="4" width="18" height="18" rx="2"/><path d="m8.5 16 2 2 5-5"/>`,
+    expand: `<path d="M9 3H3v6M15 3h6v6M21 15v6h-6M9 21H3v-6"/>`,
+    collapse: `<path d="M3 9h6V3M21 9h-6V3M15 21v-6h6M9 21v-6H3"/>`,
   };
   return `<svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name] || ""}</svg>`;
+}
+function setRecommendationResultExpanded(dialogId, expanded) {
+  const dialog = $(`#${dialogId}`);
+  if (!dialog) return;
+  dialog.classList.toggle("result-expanded",expanded);
+  document.querySelectorAll(`[data-result-size-toggle="${dialogId}"]`).forEach(button=>{
+    const label = expanded ? "Свернуть таблицу" : "Увеличить таблицу";
+    button.innerHTML = actionIcon(expanded ? "collapse" : "expand");
+    button.title = label; button.setAttribute("aria-label",label); button.setAttribute("aria-pressed",String(expanded));
+  });
+}
+function toggleRecommendationResultSize(dialogId) {
+  const dialog = $(`#${dialogId}`);
+  if (dialog) setRecommendationResultExpanded(dialogId,!dialog.classList.contains("result-expanded"));
 }
 function movieRatings(item) { return `${text(item.imdb_rating)} / ${text(item.kinopoisk_rating)}`; }
 function plannedSoonButton(item) {
@@ -287,6 +315,43 @@ function albumRow(item) {
   const action = `<button type="button" class="mini-button like reaction-button outline-action-button" data-item-action="like" data-id="${escapeHtml(item.id)}" title="Понравилось" aria-label="Понравилось">${actionIcon("like")}</button><button type="button" class="mini-button dislike reaction-button outline-action-button" data-item-action="dislike" data-id="${escapeHtml(item.id)}" title="Не понравилось" aria-label="Не понравилось">${actionIcon("dislike")}</button><button type="button" class="icon-button trash-button outline-action-button" data-trash-entity="album" data-id="${escapeHtml(item.id)}" title="В корзину" aria-label="Переместить альбом в корзину">${actionIcon("trash")}</button>`;
   const titleCell = `<button class="movie-title-button" data-details-id="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title_original || title(item))}</strong><span>${escapeHtml(text(item.artists))}</span></button>`;
   return `<tr><td class="album-cover-cell">${albumCoverHtml(item)}</td><td class="movie-title">${titleCell}</td><td>${escapeHtml(text(item.artists))}</td><td>${escapeHtml(text(item.first_release_date || item.year))}</td><td>${escapeHtml(text(item.track_count))}</td><td>${escapeHtml(listenCount(item))}</td><td class="cell-links"><a class="external-link" href="${escapeHtml(youtubeMusicAlbumUrl(item))}" target="_blank" rel="noreferrer">YouTube Music ↗</a></td><td class="added-at-cell">${escapeHtml(addedDate(item.added_at))}</td><td class="planned-soon-cell">${plannedSoonButton(item)}</td><td><div class="table-actions">${action}</div></td></tr>`;
+}
+
+function planningActionButton(item, index) {
+  const active = Boolean(item.planned_soon);
+  return `<button type="button" class="mini-button card-action-button planning-action-button${active ? " active" : ""}" data-planning-action="${index}"${active ? " disabled" : ""} aria-label="${active ? "Запланировано" : "Запланировать на ближайшее время"}">${actionIcon("calendarCheck")}<span>${active ? "Запланировано" : "Запланировать"}</span></button>`;
+}
+
+function planningMovieRow(item, index) {
+  const titleCell = `<button type="button" class="movie-title-button" data-planning-details="${index}"><strong>${escapeHtml(title(item))}</strong><span>${escapeHtml(item.title_original)}</span></button><div class="movie-title-links">${backlogMovieLinksHtml(item)}</div>`;
+  return `<tr>
+    <td class="movie-poster-cell">${moviePosterHtml(item)}</td><td class="movie-title backlog-title-cell">${titleCell}</td>
+    <td>${escapeHtml(text(item.release_date || item.year))}</td><td>${directorsCellHtml(item.directors)}</td>
+    <td>${escapeHtml(movieRatings(item))}</td><td class="cell-people">${escapeHtml(text(formatKeyPeople(item, true, true, true)))}</td>
+    <td>${escapeHtml(text(item.countries))}</td><td class="added-at-cell">${escapeHtml(addedDate(item.added_at))}</td>
+    <td class="planning-reason-cell">${escapeHtml(text(item.planning_reason))}</td><td><div class="table-actions planning-table-actions">${planningActionButton(item,index)}</div></td>
+  </tr>`;
+}
+
+function planningAlbumRow(item, index) {
+  const titleCell = `<button type="button" class="movie-title-button" data-planning-details="${index}"><strong>${escapeHtml(item.title_original || title(item))}</strong><span>${escapeHtml(text(item.artists))}</span></button>`;
+  return `<tr><td class="album-cover-cell">${albumCoverHtml(item)}</td><td class="movie-title">${titleCell}</td><td>${escapeHtml(text(item.artists))}</td><td>${escapeHtml(text(item.first_release_date || item.year))}</td><td>${escapeHtml(text(item.track_count))}</td><td>${escapeHtml(listenCount(item))}</td><td class="cell-links">${albumLinksHtml(item)}</td><td class="added-at-cell">${escapeHtml(addedDate(item.added_at))}</td><td class="planning-reason-cell">${escapeHtml(text(item.planning_reason))}</td><td><div class="table-actions planning-table-actions">${planningActionButton(item,index)}</div></td></tr>`;
+}
+
+function renderPlanningRecommendations() {
+  const music = state.contentType === "music";
+  $("#backlog-planning-head").innerHTML = music
+    ? `<tr><th>Обложка</th><th>Название</th><th>Исполнитель</th><th>Первый выпуск</th><th>Песен</th><th>Прослушивания</th><th>Link</th><th>Добавлено</th><th>Почему сейчас</th><th>Действие</th></tr>`
+    : `<tr><th>Постер</th><th>Название</th><th>Дата выхода</th><th>Режиссёр</th><th>IMDb / КП</th><th>Ключевые персоны</th><th>Страны</th><th>Добавлено</th><th>Почему сейчас</th><th>Действие</th></tr>`;
+  $("#backlog-planning-body").innerHTML = state.planningItems.map(music ? planningAlbumRow : planningMovieRow).join("");
+  $("#planning-result-title").textContent = music ? "Подходящие альбомы" : "Подходящие фильмы";
+  const noun = music ? "альбомов" : "фильмов";
+  $("#backlog-planning-message").textContent = state.planningCancelled
+    ? `Подбор остановлен. Показано ${state.planningItems.length} ${noun}.`
+    : state.planningItems.length
+      ? `Codex выбрал ${state.planningItems.length} ${noun} под ваше настроение.`
+      : `Подходящих ${noun} в бэклоге не найдено.`;
+  $("#backlog-planning-result").classList.remove("hidden");
 }
 
 function recommendationMovieRow(item, index, filtered = false) {
@@ -1084,6 +1149,143 @@ async function clearTrash(button) {
   finally { button.textContent = "Очистить всю корзину"; }
 }
 
+function renderPlanningMoodChips() {
+  const suggestions = state.planningMoods;
+  $("#planning-mood-chips").innerHTML = suggestions.map(suggestion =>
+    `<button type="button" class="planning-mood-chip${state.selectedPlanningMoods.includes(suggestion) ? " active" : ""}" data-planning-mood="${escapeHtml(suggestion)}" aria-pressed="${state.selectedPlanningMoods.includes(suggestion)}">${escapeHtml(suggestion)}</button>`
+  ).join("");
+  $("#planning-mood-chips").scrollLeft = 0;
+}
+
+function syncPlanningMoodSelection() {
+  const lines = new Set($("#planning-mood").value.split(/\r?\n/).map(line=>line.trim().toLocaleLowerCase("ru")).filter(Boolean));
+  state.selectedPlanningMoods = state.planningMoods.filter(mood=>lines.has(mood.toLocaleLowerCase("ru")));
+  document.querySelectorAll("[data-planning-mood]").forEach(button=>{
+    const active = state.selectedPlanningMoods.includes(button.dataset.planningMood);
+    button.classList.toggle("active",active); button.setAttribute("aria-pressed",String(active));
+  });
+}
+
+function togglePlanningMood(mood) {
+  const input = $("#planning-mood"), normalized = mood.toLocaleLowerCase("ru");
+  const active = state.selectedPlanningMoods.some(value=>value.toLocaleLowerCase("ru")===normalized);
+  if (active) {
+    input.value = input.value.split(/\r?\n/).filter(line=>line.trim().toLocaleLowerCase("ru")!==normalized).join("\n").replace(/^\n+|\n+$/g,"");
+  } else {
+    const current = input.value.replace(/\s+$/,"");
+    input.value = current ? `${current}\n${mood}` : mood;
+  }
+  input.dispatchEvent(new Event("input",{bubbles:true})); input.focus();
+}
+
+function togglePlanningPeriod(period) {
+  state.planningPeriod = state.planningPeriod === period ? "" : period;
+  document.querySelectorAll("[data-planning-period]").forEach(button=>{
+    const active = button.dataset.planningPeriod === state.planningPeriod;
+    button.classList.toggle("active",active); button.setAttribute("aria-pressed",String(active));
+  });
+}
+
+async function refreshPlanningMoods() {
+  if (operationRunning()) { toast("Дождитесь завершения текущей операции или остановите её"); return; }
+  const button = $("#refresh-planning-moods"), submit = $("#backlog-planning-submit"), errorNode = $("#backlog-planning-error");
+  button.disabled = true; button.textContent = "Обновляю…"; submit.disabled = true; errorNode.textContent = "";
+  let progressId = "";
+  try {
+    progressId = globalThis.crypto?.randomUUID?.() || `planning-moods-${Date.now()}-${Math.random()}`;
+    startRecommendationProgress(progressId,1,"Codex · настроения бэклога","запросов",{
+      container:"#planning-progress",stages:"#planning-progress-stages",stop:"#planning-stop",kind:"planning",warnings:false,
+    });
+    const result = await request("/api/backlog/planning/moods/llm", {method:"POST",body:JSON.stringify({
+      content_type:state.contentType,progress_id:progressId,
+    })});
+    if (!result.cancelled && result.moods?.length) {
+      state.planningMoods = result.moods.slice(0,15);
+      syncPlanningMoodSelection(); renderPlanningMoodChips();
+      $("#backlog-planning-model").textContent = result.model || "Codex";
+      $("#backlog-planning-provider").textContent = `${state.llm.provider || "Codex SDK"}${result.model ? ` · ${result.model}` : ""}`;
+      toast("Настроения бэклога обновлены");
+    }
+  } catch (error) { errorNode.textContent = error.message; }
+  finally {
+    if (progressId) await finishRecommendationProgress(progressId);
+    button.disabled = false; button.textContent = "↻ Обновить"; submit.disabled = false;
+  }
+}
+
+function openBacklogPlanning() {
+  if (operationRunning()) { toast("Дождитесь завершения текущей операции или остановите её"); return; }
+  const backlog = state.items.filter(item => item.status === "backlog");
+  if (!backlog.length) { toast(state.contentType === "music" ? "В музыкальном бэклоге пока нечего планировать" : "В бэклоге пока нечего планировать"); return; }
+  const music = state.contentType === "music", form = $("#backlog-planning-form");
+  setRecommendationResultExpanded("backlog-planning-dialog",false);
+  form.reset();
+  state.planningItems = []; state.planningCancelled = false; state.planningPeriod = "";
+  state.planningMoods = [...(planningMoodSuggestions[state.contentType] || [])]; state.selectedPlanningMoods = [];
+  renderPlanningMoodChips();
+  document.querySelectorAll("[data-planning-period]").forEach(button=>{button.classList.remove("active");button.setAttribute("aria-pressed","false");});
+  $("#planning-title").textContent = music ? "Что послушать сейчас" : "Что посмотреть сейчас";
+  $("#planning-suggestions-title").textContent = music ? "Настроение альбомов в бэклоге" : "Настроение фильмов в бэклоге";
+  $("#planning-limit-label").textContent = music ? "Макс. кол-во альбомов" : "Макс. кол-во фильмов";
+  $("#planning-context-note").textContent = music
+    ? "Codex выберет только из альбомов, уже добавленных в ваш бэклог. Объяснения модели останутся только в этом окне."
+    : "Codex выберет только из фильмов, уже добавленных в ваш бэклог. Объяснения модели останутся только в этом окне.";
+  $("#planning-mood").placeholder = music
+    ? "Например: хочу сумрачную электронику для спокойного позднего вечера"
+    : "Например: хочу напряжённое, визуально сильное кино без тяжёлого послевкусия";
+  $("#backlog-planning-error").textContent = "";
+  $("#backlog-planning-result").classList.add("hidden");
+  $("#backlog-planning-body").innerHTML = "";
+  const provider = state.llm.provider || "Codex SDK", model = state.llm.model ? ` · ${state.llm.model}` : "";
+  $("#backlog-planning-provider").textContent = `${provider}${model}${state.llm.configured === false ? " · требуется установка" : ""}`;
+  $("#backlog-planning-dialog").showModal();
+  $("#planning-mood").focus();
+}
+
+async function runBacklogPlanning(event) {
+  event.preventDefault();
+  if (operationRunning()) { toast("Дождитесь завершения текущей операции или остановите её"); return; }
+  const form = event.currentTarget, button = $("#backlog-planning-submit"), refreshButton = $("#refresh-planning-moods"), errorNode = $("#backlog-planning-error");
+  button.disabled = true; refreshButton.disabled = true; button.textContent = "Подбираю…"; errorNode.textContent = "";
+  $("#backlog-planning-result").classList.add("hidden");
+  let progressId = "";
+  try {
+    const values = formPayload(form);
+    progressId = globalThis.crypto?.randomUUID?.() || `planning-${Date.now()}-${Math.random()}`;
+    startRecommendationProgress(progressId,1,"Codex · выбор из бэклога","запросов",{
+      container:"#planning-progress",stages:"#planning-progress-stages",stop:"#planning-stop",kind:"planning",warnings:false,
+    });
+    const result = await request("/api/backlog/planning/llm", {method:"POST",body:JSON.stringify({
+      content_type:state.contentType,mood:values.mood,period:state.planningPeriod,limit:values.limit,progress_id:progressId,
+    })});
+    state.planningItems = result.items || [];
+    state.planningCancelled = Boolean(result.cancelled);
+    $("#backlog-planning-model").textContent = result.model || "Codex";
+    renderPlanningRecommendations();
+  } catch (error) { errorNode.textContent = error.message; }
+  finally { if (progressId) await finishRecommendationProgress(progressId); button.disabled = false; refreshButton.disabled = false; button.textContent = "Подобрать"; }
+}
+
+async function planBacklogRecommendation(index, button) {
+  const item = state.planningItems[index];
+  if (!item || item.planned_soon) return;
+  try {
+    const outcome = await cardActionWithFeedback(button, () => request(
+      `/api/library/${encodeURIComponent(item.id)}`,
+      {method:"PATCH",body:JSON.stringify({planned_soon:true})},
+    ));
+    if (!outcome) return;
+    const updated = outcome.value.item;
+    state.items = state.items.map(existing => existing.id === updated.id ? updated : existing);
+    state.planningItems = state.planningItems.map(existing => existing.id === updated.id
+      ? {...updated,planning_reason:existing.planning_reason}
+      : existing
+    );
+    renderLibrary(); renderPlanningRecommendations();
+    toast(state.contentType === "music" ? "Альбом запланирован" : "Фильм запланирован");
+  } catch (error) { toast(error.message); }
+}
+
 function renderRecommendationHead() {
   const sort = (label,key) => `<button class="sort-button" type="button" data-recommend-sort="${key}">${label}</button>`;
   const notes = state.backlogRecommendMode === "llm" ? `<th>${sort("Заметка","notes")}</th>` : "";
@@ -1117,6 +1319,7 @@ function setBacklogRecommendMode(mode) {
 
 function openBacklogRecommendation(mode = "llm") {
   if(operationRunning()){toast("Дождитесь завершения текущей операции или остановите её");return;}
+  setRecommendationResultExpanded("backlog-recommend-dialog",false);
   const currentYear = new Date().getFullYear();
   for (const yearTo of [$("#backlog-year-to"), $("#api-year-to"), $("#album-llm-year-to"), $("#album-api-year-to")]) {
     yearTo.max = String(currentYear + 2); yearTo.value = String(currentYear);
@@ -1403,7 +1606,10 @@ document.addEventListener("click", async event => {
   const filteredReasons = event.target.closest("[data-open-filtered-reasons]"); if (filteredReasons) { if(currentFilteredRecommendations().length) $("#filtered-reasons-dialog").showModal();return; }
   const rawResponse = event.target.closest("[data-open-llm-raw-response]"); if (rawResponse) { if(state.llmRawResponse){$("#llm-raw-response-output").textContent=state.llmRawResponse;$("#llm-raw-response-dialog").showModal();}return; }
   const promptPreview = event.target.closest("[data-view-llm-prompt]"); if (promptPreview) { await toggleLlmPromptPreview(promptPreview); return; }
-  const close = event.target.closest("[data-close-dialog]"); if (close) { if((close.dataset.closeDialog==="backlog-recommend-dialog"&&activeOperations.recommendation)||(close.dataset.closeDialog==="people-recommend-dialog"&&activeOperations.people)){toast("Сначала остановите текущую рекомендацию");return;}$(`#${close.dataset.closeDialog}`).close(); return; }
+  const planningMood = event.target.closest("[data-planning-mood]"); if (planningMood) { togglePlanningMood(planningMood.dataset.planningMood);return; }
+  const planningPeriod = event.target.closest("[data-planning-period]"); if (planningPeriod) { togglePlanningPeriod(planningPeriod.dataset.planningPeriod);return; }
+  const resultSizeToggle = event.target.closest("[data-result-size-toggle]"); if (resultSizeToggle) { toggleRecommendationResultSize(resultSizeToggle.dataset.resultSizeToggle);return; }
+  const close = event.target.closest("[data-close-dialog]"); if (close) { if((close.dataset.closeDialog==="backlog-recommend-dialog"&&activeOperations.recommendation)||(close.dataset.closeDialog==="backlog-planning-dialog"&&activeOperations.planning)||(close.dataset.closeDialog==="people-recommend-dialog"&&activeOperations.people)){toast("Сначала остановите текущую рекомендацию");return;}$(`#${close.dataset.closeDialog}`).close(); return; }
   const sort = event.target.closest("[data-sort]"); if (sort) { const key=sort.dataset.sort; state.sortDirection = state.sortKey === key ? (state.sortDirection === "asc" ? "desc" : "asc") : (["planned_soon","added_at"].includes(key) ? "desc" : "asc"); state.sortKey=key; renderLibrary(); return; }
   const recommendationSort = event.target.closest("[data-recommend-sort]"); if (recommendationSort) { const key=recommendationSort.dataset.recommendSort,setting=state.recommendationSort;setting.direction=setting.key===key&&setting.direction==="asc"?"desc":"asc";setting.key=key;if(state.backlogRecommendMode==="llm")renderLlmRecommendations();else renderApiRecommendations();return; }
   const peopleSort=event.target.closest("[data-people-sort]");if(peopleSort){const role=peopleSort.dataset.peopleRole,key=peopleSort.dataset.peopleSort,setting=state.peopleSort[role];setting.direction=setting.key===key&&setting.direction==="asc"?"desc":"asc";setting.key=key;renderPeople();return;}
@@ -1419,6 +1625,8 @@ document.addEventListener("click", async event => {
   const removeRecommendedPersonButton = event.target.closest("[data-remove-recommended-person]"); if (removeRecommendedPersonButton) { await removeRecommendedPerson(Number(removeRecommendedPersonButton.dataset.removeRecommendedPerson),removeRecommendedPersonButton);return; }
   const modalRecDetails = event.target.closest("[data-modal-rec-details]"); if (modalRecDetails) { const items=state.backlogRecommendMode === "llm" ? state.llmItems : state.apiItems; showDetails(items[Number(modalRecDetails.dataset.modalRecDetails)]); return; }
   const filteredRecDetails = event.target.closest("[data-filtered-rec-details]"); if (filteredRecDetails) { const record=currentFilteredRecommendations()[Number(filteredRecDetails.dataset.filteredRecDetails)];showDetails(record?.item);return; }
+  const planningDetails = event.target.closest("[data-planning-details]"); if (planningDetails) { showDetails(state.planningItems[Number(planningDetails.dataset.planningDetails)]); return; }
+  const planningAction = event.target.closest("[data-planning-action]"); if (planningAction) { await planBacklogRecommendation(Number(planningAction.dataset.planningAction),planningAction); return; }
   const plannedSoon = event.target.closest("[data-planned-soon-toggle]"); if (plannedSoon) { const item=state.items.find(x=>x.id===plannedSoon.dataset.id);if(item)await patchItemWithFeedback(plannedSoon,item.id,{planned_soon:!item.planned_soon});return; }
   const itemAction = event.target.closest("[data-item-action]"); if (itemAction) { const action=itemAction.dataset.itemAction;await patchItemWithFeedback(itemAction,itemAction.dataset.id,action === "backlog" ? {status:"backlog"} : {status:"consumed",reaction:action},{exit:true});return; }
   const reaction = event.target.closest("[data-reaction-toggle]"); if (reaction) { const item=state.items.find(x=>x.id===reaction.dataset.id);if(item){const next=item.reaction===reaction.dataset.reactionToggle ? "" : reaction.dataset.reactionToggle;await patchItemWithFeedback(reaction,item.id,{reaction:next},{exit:true});}return; }
@@ -1438,16 +1646,20 @@ document.addEventListener("keydown", event => {
 });
 document.addEventListener("error",event=>{if(event.target.matches?.("[data-artwork]")){const placeholder=document.createElement("span"),isPerson=event.target.classList.contains("person-photo")||event.target.classList.contains("detail-person-photo");placeholder.className=isPerson?`person-photo-placeholder${event.target.classList.contains("detail-person-photo")?" detail-person-photo":""}`:event.target.classList.contains("movie-poster")||event.target.classList.contains("rated-card-poster")||event.target.classList.contains("detail-poster")?"movie-poster-placeholder":"album-cover-placeholder";placeholder.setAttribute("aria-hidden","true");event.target.replaceWith(placeholder);}},true);
 document.addEventListener("change", event => { const all=event.target.closest("[data-select-all]"); if (all) document.querySelectorAll(`input[name="${all.dataset.selectAll}_ids"]`).forEach(box=>box.checked=all.checked); if (all || event.target.matches('input[name="actor_ids"],input[name="director_ids"],input[name="artist_ids"]')) updateSelectedLabels(); });
-document.addEventListener("input",event=>{const search=event.target.closest("[data-person-search]");if(search)filterPersonOptions(search.dataset.personSearch);if(event.target.closest("#backlog-recommend-form,#album-recommend-form"))hideLlmPromptPreview();});
+document.addEventListener("input",event=>{const search=event.target.closest("[data-person-search]");if(search)filterPersonOptions(search.dataset.personSearch);if(event.target.id==="planning-mood")syncPlanningMoodSelection();if(event.target.closest("#backlog-recommend-form,#album-recommend-form"))hideLlmPromptPreview();});
 document.addEventListener("dblclick",event=>{const note=event.target.closest("[data-editable-note]");if(note)editNote(note);});
 document.querySelectorAll(".people-filter details").forEach(details=>details.addEventListener("toggle",()=>{syncPeopleMenuLayout();if(details.open)requestAnimationFrame(()=>details.querySelector("[data-person-search]")?.focus());}));
-document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => { if (dialog.id === "backlog-recommend-dialog" || (dialog.id === "people-recommend-dialog" && activeOperations.people)) return; const rect=dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); }));
+document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => { if (["backlog-recommend-dialog","backlog-planning-dialog"].includes(dialog.id) || (dialog.id === "people-recommend-dialog" && activeOperations.people)) return; const rect=dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close(); }));
 $("#backlog-recommend-dialog").addEventListener("cancel", event => event.preventDefault());
+$("#backlog-planning-dialog").addEventListener("cancel", event => event.preventDefault());
 $("#people-recommend-dialog").addEventListener("cancel", event => {if(activeOperations.people){event.preventDefault();toast("Сначала остановите текущую рекомендацию");}});
 $("#person-photo-view-dialog").addEventListener("close", () => $("#person-photo-view-image").removeAttribute("src"));
 
 document.querySelectorAll("[data-library-search]").forEach(input => input.addEventListener("input", event => { state.query=event.target.value;syncSearchControls();renderLibrary();renderPeople(); })); $("#refresh-tmdb").addEventListener("click", refreshTmdb); $("#refresh-people").addEventListener("click", refreshPeople); $("#refresh-detail").addEventListener("click", refreshCurrentMovie); $("#refresh-person-detail").addEventListener("click", refreshCurrentPerson);
 $("#open-people-recommend").addEventListener("click",openPeopleRecommendation); $("#people-recommend-form").addEventListener("submit",runPeopleRecommendation);
+$("#open-backlog-planning").addEventListener("click",openBacklogPlanning); $("#backlog-planning-form").addEventListener("submit",runBacklogPlanning);
+$("#refresh-planning-moods").addEventListener("click",refreshPlanningMoods);
+document.querySelectorAll("#planning-mood-chips,.planning-period-chips").forEach(track=>track.addEventListener("wheel",event=>{if(Math.abs(event.deltaY)>Math.abs(event.deltaX)){event.preventDefault();event.currentTarget.scrollBy({left:event.deltaY,behavior:"auto"});}},{passive:false}));
 $("#open-backlog-recommend").addEventListener("click",()=>openBacklogRecommendation("llm")); $("#open-backlog-api-recommend").addEventListener("click",()=>openBacklogRecommendation("api")); $("#backlog-recommend-form").addEventListener("submit", runBacklogRecommendation); $("#album-recommend-form").addEventListener("submit", runBacklogRecommendation); $("#backlog-api-form").addEventListener("submit", runBacklogApiRecommendation); $("#album-api-form").addEventListener("submit", runBacklogApiRecommendation);
 $("#open-add").addEventListener("click",event=>{ event.currentTarget.closest("details")?.removeAttribute("open");if(state.contentType === "music"){resetAlbumDraft();$("#add-album-dialog").showModal();$("#add-album-form").elements.namedItem("title_original").focus();}else{resetMovieDraft();$("#add-dialog").showModal();$("#add-form").elements.namedItem("title_ru").focus();} });
 $("#open-add-person").addEventListener("click",event=>{ event.currentTarget.closest("details")?.removeAttribute("open");if(state.contentType === "music"){state.pendingArtistDetails=null;state.pendingArtistRaw=null;$("#add-artist-form").reset();resolveStatus("#add-artist-resolve-status");$("#add-artist-error").textContent="";$("#add-artist-dialog").showModal();}else{state.pendingPersonDetails=null;state.pendingPersonRaw=null;$("#add-person-form").reset();resolveStatus("#add-person-resolve-status");$("#add-person-error").textContent="";$("#add-person-dialog").showModal();} });

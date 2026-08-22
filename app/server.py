@@ -23,7 +23,7 @@ from app import artwork, fanart, listenbrainz, llm, musicbrainz, recommendation_
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PID_FILE = Path(__file__).resolve().parents[1] / ".runtime" / "server.pid"
 APPLICATION_ID = "whats-new-checker"
-APP_VERSION = 48
+APP_VERSION = 52
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -294,6 +294,12 @@ class Handler(BaseHTTPRequestHandler):
                     if payload.get("content_type") == "music"
                     else llm.recommend_movies(payload)
                 )
+                return
+            if parsed.path == "/api/backlog/planning/llm":
+                self._json(llm.recommend_backlog(payload))
+                return
+            if parsed.path == "/api/backlog/planning/moods/llm":
+                self._json(llm.suggest_backlog_moods(payload))
                 return
             if parsed.path == "/api/recommendations/people/llm":
                 self._json(llm.recommend_people(payload))
